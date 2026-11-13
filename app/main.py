@@ -1,0 +1,599 @@
+# 1. 先导入并执行 LangSmith 配置（必须在所有业务代码之前！）
+import asyncio
+import logging
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import Any, cast
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.application.services.chat_service import ChatService
+from app.application.services.ingest_service import IngestService
+from app.config.settings import settings
+from app.config.tracing_config import (
+    configure_langsmith,
+    get_langsmith_client,
+    is_langsmith_enabled,
+)
+from app.infrastructure.agent.a2a_protocol import A2AProtocol
+from app.infrastructure.agent.agent_coordinator import MultiAgentOrchestrator
+from app.infrastructure.agent.agent_registry import AgentDescriptor, AgentRegistry
+from app.infrastructure.agent.intervention_handler import InterventionHandler
+from app.infrastructure.audit.audit_logger import audit_logger
+from app.infrastructure.embedding.embedding_client import EmbeddingClient
+from app.infrastructure.fault.fault_analyzer import FaultAnalyzer
+from app.infrastructure.llm.model_client import ModelAuthError, ModelClient, ModelRequestError
+from app.infrastructure.memory.models import TaskStatus
+from app.infrastructure.memory.redis_postgres_conversation_memory import (
+    MemoryScope,
+    RedisPostgresConversationMemoryStore,
+)
+from app.infrastructure.queue.redis_stream import RedisStreamWorker
+from app.infrastructure.security.auth import get_rate_limit_identity
+from app.infrastructure.vectorstore.chroma_store import ChromaStore
+from app.observability.alert_manager import alert_manager
+from app.observability.alert_types import AlertSeverity, AlertTypes
+from app.observability.langsmith_tracer import LangSmithTracer
+from app.observability.logging_config import configure_logging, request_id_context
+from app.observability.metrics import MetricsCollector
+from app.observability.prometheus_metrics import (
+    ACTIVE_REQUESTS,
+    REQUEST_COUNT,
+    REQUEST_LATENCY,
+)
+from app.rag.retrieval.retriever import Retriever
+from app.schemas.errors import AppError, ErrorCode, error_payload
+from app.schemas.ingest import IngestTextRequest
+
+
+def get_user_rate_limit_key(request: Request) -> str:
+    """按用户/租户维度限流，降级回 IP。"""
+    # 尝试从 Authorization token 中提取用户标识
+    auth_header = request.headers.get("Authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() == "bearer" and token:
+        user_key = get_rate_limit_identity(token)
+        if user_key:
+            return user_key
+
+    # 降级为 IP 限流
+    return f"ip:{get_remote_address(request)}"
+
+
+request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+
+logger = logging.getLogger(__name__)
+
+
+limiter = Limiter(
+    key_func=get_user_rate_limit_key,
+    storage_uri=settings.rate_limit_storage_uri,
+    in_memory_fallback_enabled=True,
+    swallow_errors=False,
+    key_prefix=f"{settings.app_name}:",
+)
+
+
+def create_app() -> FastAPI:
+    configure_logging(settings.log_level)
+    configure_langsmith()
+    from app.api.routers.admin import router as admin_router
+    from app.api.routers.chat import router as chat_router
+    from app.api.routers.health import router as health_router
+    from app.api.routers.ingest import router as ingest_router
+
+    app = FastAPI(
+        title=settings.app_name,
+        version="0.2.0",
+    )
+
+    @app.middleware("http")
+    async def concurrency_middleware(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if not request.url.path.startswith(("/chat", "/ingest", "/admin")):
+            return await call_next(request)
+        try:
+            await asyncio.wait_for(request_semaphore.acquire(), timeout=1.0)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content=error_payload(
+                    ErrorCode.SERVICE_OVERLOADED,
+                    request_id=request.headers.get("X-Request-ID", ""),
+                ),
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            request_semaphore.release()
+
+    @app.middleware("http")
+    async def observability_middleware(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        request_token = request_id_context.set(request_id)
+        started_at = time.perf_counter()
+        ACTIVE_REQUESTS.inc()
+        response: Response | None = None
+        status_code = 500
+
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            elapsed_seconds = time.perf_counter() - started_at
+            REQUEST_COUNT.labels(
+                method=request.method,
+                path=request.url.path,
+                status=str(status_code),
+            ).inc()
+            REQUEST_LATENCY.labels(
+                method=request.method,
+                path=request.url.path,
+            ).observe(elapsed_seconds)
+            ACTIVE_REQUESTS.dec()
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+            request_id_context.reset(request_token)
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    app.include_router(health_router)
+    app.include_router(chat_router)
+    app.include_router(ingest_router)
+    app.include_router(admin_router)
+    app.state.limiter = limiter
+
+    trace = LangSmithTracer(
+        client=get_langsmith_client(),
+        _enabled=is_langsmith_enabled(),
+        project_name=settings.langsmith_project,
+        service_name="enterprise-alert-agent",
+    )
+    embedding_client = EmbeddingClient(tracer=trace)
+    chroma_store = ChromaStore(embedding_client=embedding_client, tracer=trace)
+    memory = RedisPostgresConversationMemoryStore()
+    retriever = Retriever(chroma_store=chroma_store, tracer=trace)
+    model_client = ModelClient(tracer=trace)
+    fault_analyzer = FaultAnalyzer()
+    intervention_handler = InterventionHandler()
+    metrics_collector = MetricsCollector()
+    agent_registry = AgentRegistry()
+    agent_registry.register_agent(
+        AgentDescriptor(
+            agent_id="router_agent",
+            display_name="Router Agent",
+            capabilities=["intent_routing", "tool_selection"],
+            supported_tools=[],
+            priority=100,
+        )
+    )
+    agent_registry.register_agent(
+        AgentDescriptor(
+            agent_id="rag_agent",
+            display_name="RAG Agent",
+            capabilities=["knowledge_retrieval", "summary_generation"],
+            supported_tools=[],
+            priority=80,
+        )
+    )
+    agent_registry.register_agent(
+        AgentDescriptor(
+            agent_id="sql_agent",
+            display_name="SQL Agent",
+            capabilities=["database_query"],
+            supported_tools=[],
+            priority=90,
+        )
+    )
+    agent_registry.register_agent(
+        AgentDescriptor(
+            agent_id="time_agent",
+            display_name="Time Agent",
+            capabilities=["time_query"],
+            supported_tools=["get_current_datetime"],
+            priority=95,
+        )
+    )
+    checkpoint_stack = AsyncExitStack()
+    app.state.checkpoint_stack = checkpoint_stack
+
+    a2a_protocol = A2AProtocol()
+    orchestrator = MultiAgentOrchestrator(agent_registry, a2a_protocol)
+    app.state.shared_dependencies = {
+        "embedding_client": embedding_client,
+        "chroma_store": chroma_store,
+        "memory": memory,
+        "retriever": retriever,
+        "model_client": model_client,
+        "trace": trace,
+        "agent_registry": agent_registry,
+        "orchestrator": orchestrator,
+        "fault_analyzer": fault_analyzer,
+        "intervention_handler": intervention_handler,
+        "alert_manager": alert_manager,
+        "metrics_collector": metrics_collector,
+        "audit_logger": audit_logger,
+        "fault_checkpointer": None,
+    }
+
+    # 静态文件和首页
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app.get("/")
+    def index() -> FileResponse:
+        return FileResponse(
+            str(static_dir / "index.html"),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
+
+    def rate_limit_handler(_request: Request, exc: Exception) -> Response:
+        if not isinstance(exc, RateLimitExceeded):
+            raise TypeError("Expected RateLimitExceeded")
+        if exc.limit is None:
+            raise RuntimeError("Rate limit details are unavailable")
+        limit = exc.limit.limit
+        return JSONResponse(
+            status_code=429,
+            content=error_payload(
+                ErrorCode.RATE_LIMIT_EXCEEDED,
+                request_id=_request_id(_request),
+            ),
+            headers={
+                "Retry-After": str(limit.get_expiry()),
+                "X-RateLimit-Limit": str(limit.amount),
+            },
+        )
+
+    def _request_id(request: Request) -> str:
+        return getattr(request.state, "request_id", "")
+
+    def app_error_handler(request: Request, exc: Exception) -> Response:
+        err = cast(AppError, exc)
+        return JSONResponse(
+            status_code=err.status_code,
+            content=error_payload(
+                err.code,
+                err.message,
+                request_id=_request_id(request),
+                details=err.details,
+            ),
+            headers=err.headers,
+        )
+
+    def validation_error_handler(request: Request, exc: Exception) -> Response:
+        errors = cast(RequestValidationError, exc).errors()
+        fields = [{"field": ".".join(str(p) for p in e["loc"]), "reason": e["msg"]} for e in errors]
+        return JSONResponse(
+            status_code=422,
+            content=error_payload(
+                ErrorCode.VALIDATION_FAILED, request_id=_request_id(request), details=fields
+            ),
+        )
+
+    def unhandled_error_handler(request: Request, exc: Exception) -> Response:
+        logger.exception("Unhandled error: request_id=%s", _request_id(request))
+        return JSONResponse(
+            status_code=500,
+            content=error_payload(ErrorCode.INTERNAL_ERROR, request_id=_request_id(request)),
+        )
+
+    # 兼容存量 HTTPException：按状态码映射为错误码，新代码应直接抛 AppError
+    _status_to_code = {
+        400: ErrorCode.REQUEST_INVALID,
+        401: ErrorCode.AUTH_INVALID_TOKEN,
+        403: ErrorCode.AUTH_FORBIDDEN,
+        404: ErrorCode.RESOURCE_NOT_FOUND,
+        409: ErrorCode.REQUEST_CONFLICT,
+        413: ErrorCode.PAYLOAD_TOO_LARGE,
+        422: ErrorCode.VALIDATION_FAILED,
+        429: ErrorCode.RATE_LIMIT_EXCEEDED,
+        503: ErrorCode.SERVICE_UNAVAILABLE,
+    }
+
+    def http_exception_handler(request: Request, exc: Exception) -> Response:
+        http_exc = cast(StarletteHTTPException, exc)
+        code = _status_to_code.get(http_exc.status_code, ErrorCode.INTERNAL_ERROR)
+        detail = http_exc.detail
+        return JSONResponse(
+            status_code=http_exc.status_code,
+            content=error_payload(
+                code,
+                detail if isinstance(detail, str) else None,
+                request_id=_request_id(request),
+                details=detail if isinstance(detail, dict) else None,
+            ),
+            headers=http_exc.headers,
+        )
+
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+
+    app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(Exception, unhandled_error_handler)
+
+    @app.on_event("startup")
+    async def startup_checks() -> None:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from redis import asyncio as redis_asyncio
+
+        from app.infrastructure.mcp.mcp_client import async_init_mcp
+        from app.infrastructure.queue.dlq_handler import dead_letter_queue
+
+        if not settings.langgraph_checkpoint_dsn.strip():
+            raise ValueError("LANGGRAPH_CHECKPOINT_DSN is empty.")
+        try:
+            fault_checkpoint = await checkpoint_stack.enter_async_context(
+                AsyncPostgresSaver.from_conn_string(
+                    settings.langgraph_checkpoint_dsn,
+                )
+            )
+            await fault_checkpoint.setup()
+        except Exception as e:
+            await checkpoint_stack.aclose()
+            raise RuntimeError("Failed to initialize checkpoint stack") from e
+        app.state.shared_dependencies["fault_checkpointer"] = fault_checkpoint
+
+        await memory.awarmup()  # 异步预热 Redis/PostgreSQL 连接池
+        try:
+            replay_owner = f"startup:{uuid.uuid4()}"
+            replayable_tasks = await memory.aclaim_replayable_task_states(owner=replay_owner)
+            if replayable_tasks:
+                logger.warning("There are replayable tasks at startup.")
+                replay_service = ChatService(
+                    model_client=model_client,
+                    retriever=retriever,
+                    trace=trace,
+                    memory=memory,
+                    _intervention_handler=intervention_handler,
+                    _alert_manager=alert_manager,
+                    _metrics_collector=metrics_collector,
+                    agent_registry=agent_registry,
+                    orchestrator=orchestrator,
+                    fault_checkpointer=fault_checkpoint,
+                )
+                for task in replayable_tasks:
+                    try:
+                        logger.warning("Replaying task: %s", task)
+                        await replay_service.areplay_task_from_snapshot(task)
+                    except Exception:
+                        logger.exception(
+                            "Task replay failed: request_id=%s task_id=%s",
+                            task.request_id,
+                            task.task_id,
+                        )
+                        scope = MemoryScope(
+                            tenant_id=task.tenant_id,
+                            user_id=task.user_id,
+                            thread_id=task.thread_id,
+                        )
+                        await memory.aupsert_task_state(
+                            request_id=task.request_id,
+                            task_id=task.task_id,
+                            scope=scope,
+                            description=task.description,
+                            status=TaskStatus.WAITING_HUMAN,
+                            assigned_agent_id=task.assigned_agent_id,
+                            depends_on=task.depends_on,
+                            result=task.result,
+                            error_message=task.error_message,
+                            retry_count=task.retry_count,
+                            replayable=False,
+                        )
+                        alert_manager.create_alert(
+                            alert_type=AlertTypes.FAULT_ALERT,
+                            severity=AlertSeverity.CRITICAL,
+                            title=f"中断任务已转换为等待人工干预 ({task.task_id})",
+                            message=f"请求 {task.request_id} 中的任务 {task.task_id} 因服务重启中断，状态已更新为等待人工处理",
+                            affected_resource=task.task_id,
+                            context={
+                                "tenant_id": task.tenant_id,
+                                "user_id": task.user_id,
+                                "thread_id": task.thread_id,
+                                "previous_status": task.status,
+                            },
+                        )
+
+        except Exception as e:
+            logger.error("Startup checks failed: %s", e)
+            raise
+
+        await dead_letter_queue.startup()  # 异步初始化 DLQ，从 Redis 回捞历史数据
+
+        # 初始化 Redis Stream worker
+        # 创建 IngestService 实例（用于处理异步入库任务）
+        ingest_svc = IngestService(chroma_store=chroma_store, trace=trace)
+
+        async def handle_ingest_task(payload: dict[str, Any]) -> None:
+            """处理文档入库任务"""
+            try:
+                req = IngestTextRequest(
+                    content=payload["content"],
+                    source_id=payload["source_id"],
+                    metadata=payload.get("metadata", {}),
+                )
+                # 调用同步方法（IngestService.ingest_text 是同步的）
+                result = ingest_svc.ingest_text(req)
+                logger.info("✅ Ingest completed: %s", result)
+            except Exception as e:
+                logger.error("❌ Ingest failed: %s", e)
+                raise
+
+        redis_client = redis_asyncio.Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            password=settings.redis_password,
+            decode_responses=True,
+        )
+
+        stream_worker = RedisStreamWorker(
+            redis_client=redis_client,
+            stream_key="tasks:ingest",
+            group_name="ingest-workers",
+            handler=handle_ingest_task,
+        )
+        await stream_worker.startup()
+        app.state.stream_worker = stream_worker
+        logger.info("Redis Stream worker started")
+
+        app.state.model_ready = False
+        app.state.model_check_message = "not checked"
+        app.state.mcp_ready = not settings.mcp_enabled
+        if not settings.dashscope_api_key.strip():
+            msg = "DASHSCOPE_API_KEY is empty. /chat requests will fail with 401."
+            app.state.model_check_message = msg
+            logger.warning(msg)
+            return
+
+        if not settings.model_startup_probe_enabled:
+            app.state.model_ready = True
+            app.state.model_check_message = "startup probe disabled"
+            return
+        if settings.mcp_enabled:
+            app.state.mcp_ready = await async_init_mcp()
+            if not app.state.mcp_ready:
+                logger.warning("MCP initialization failed during startup")
+
+        try:
+            startup_tracer = LangSmithTracer(
+                client=get_langsmith_client(),
+                _enabled=is_langsmith_enabled(),
+                project_name=settings.langsmith_project,
+                service_name="enterprise-alert-agent",
+            )
+
+            await ModelClient(tracer=startup_tracer).probe()
+            app.state.model_ready = True
+            app.state.model_check_message = "ok"
+        except ModelAuthError:
+            msg = "model auth failed during startup probe"
+            app.state.model_check_message = msg
+            logger.warning(msg)
+        except ModelRequestError as exc:
+            msg = f"model request failed during startup probe: {exc}"
+            app.state.model_check_message = msg
+            logger.warning(msg)
+
+    @app.on_event("shutdown")
+    async def shutdown_resources() -> None:
+        from app.api.routers.chat import drain_active_streams
+
+        logger.info("Application shutdown started")
+        try:
+            # 1) 排空在途请求：等全局闸门完全空闲（或超时），期间停止接收新请求
+            if not await _drain_inflight(
+                request_semaphore, settings.graceful_shutdown_timeout_seconds
+            ):
+                logger.warning("Not all in-flight requests completed before shutdown timeout")
+            # 排空仍在执行的 SSE 流（含正在等待 MCP 返回的工具调用）
+            if not await drain_active_streams(settings.graceful_shutdown_timeout_seconds):
+                logger.warning("Not all active streams completed before shutdown timeout")
+            # 2) 关闭各类资源
+            audit_logger.flush_to_file()  # 确保审计日志落盘
+
+            dependencies = app.state.shared_dependencies
+            try:
+                from app.infrastructure.queue.dlq_handler import dead_letter_queue
+
+                await asyncio.wait_for(
+                    dead_letter_queue.close(),
+                    timeout=settings.graceful_shutdown_timeout_seconds,
+                )
+            except TimeoutError:
+                logger.error("DLQ worker did not stop within shutdown timeout")
+            alert_manager_instance = dependencies.get("alert_manager")
+            close_alert_manager = getattr(alert_manager_instance, "close", None)
+            if close_alert_manager is not None:
+                close_alert_manager(timeout=settings.graceful_shutdown_timeout_seconds)
+            memory_store = dependencies.get("memory")
+            if memory_store is not None:
+                close_memory = getattr(memory_store, "aclose", None)
+                if close_memory is not None:
+                    await close_memory()
+                else:
+                    memory_store.close()
+            model_client = dependencies.get("model_client")
+            close_model = getattr(model_client, "aclose", None)
+            if close_model is not None:
+                await close_model()
+            from app.infrastructure.mcp.mcp_client import async_close_mcp
+
+            await async_close_mcp()
+
+            # 关闭 Redis Stream worker
+            stream_worker = getattr(app.state, "stream_worker", None)
+            if stream_worker is not None:
+                try:
+                    await asyncio.wait_for(
+                        stream_worker.close(),
+                        timeout=settings.graceful_shutdown_timeout_seconds,
+                    )
+                except TimeoutError:
+                    logger.error("Stream worker did not stop within shutdown timeout")
+        finally:
+            try:
+                await checkpoint_stack.aclose()
+            finally:
+                app.state.shared_dependencies["fault_checkpointer"] = None
+
+        logger.info("Application shutdown completed")
+
+    return app
+
+
+async def _drain_inflight(sem: asyncio.Semaphore, timeout: float) -> bool:
+    """排空在途请 求：直到能连续拿到 max_concurrent_requests 个许可（= 无在途请求）。"""
+    deadline = time.monotonic() + timeout
+    acquired = 0
+    while time.monotonic() < deadline:
+        if sem.acquire_nowait():  # type: ignore # 公开 API，返回 bool，不抛异常
+            acquired += 1
+            if acquired >= settings.max_concurrent_requests:
+                for _ in range(acquired):
+                    sem.release()
+                return True
+        else:
+            acquired = 0  # 还有请求占用许可，未排空，清零重来
+        await asyncio.sleep(0.05)
+    for _ in range(acquired):
+        sem.release()
+    return False
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)

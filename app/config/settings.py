@@ -1,0 +1,237 @@
+import logging
+import secrets
+import sys
+
+from pydantic import AliasChoices, Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+logger = logging.getLogger(__name__)
+
+
+class Settings(BaseSettings):
+    app_name: str = "enterprise-alert-agent"
+    app_env: str = "dev"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8000
+    log_level: str = "INFO"
+    llm_provider: str = "dashscope"  # dashscope / openai / anthropic / azure
+    default_model: str = "qwen-plus"
+    fallback_model: str = "qwen-turbo"
+    dashscope_api_key: str = ""
+    model_name: str = "qwen-plus"
+    fallback_model_name: str = "qwen-turbo"  # 主模型失败后的降级模型
+    dashscope_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("DASHSCOPE_BASE_URL", "BASE_URL"),
+    )
+    # 多 provider 配置
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-3-5-sonnet-20241022"
+    request_timeout_seconds: int = 30  # 单次请求读取超时
+    connect_timeout_seconds: float = 3.0  # 建立连接超时
+    model_startup_probe_enabled: bool = True
+    model_max_retries: int = 2
+    model_retry_backoff_seconds: float = 0.5
+    model_retry_backoff_cap_seconds: float = 8.0
+    model_total_deadline_seconds: float = 45.0  # 主备模型及所有重试的总时间
+    stream_idle_timeout_seconds: float = 20.0  # 流式响应相邻分片的最大等待时间
+    agent_tool_failure_threshold: int = 2  # 工具连续失败超过此数降级为纯 RAG
+    # ========================================================
+    # 🚀 新增：Agentic & Function Calling 配置（提升含金量核心）
+    # ========================================================
+    agent_max_iterations: int = (
+        5  # 允许 Agent 思考与调用工具的最大轮数            # LLM 失败重试次数
+    )
+    reflection_enabled: bool = True
+    reflection_max_rounds: int = 2  # 最大反思轮数
+    reflection_min_score: float = 0.8  # 反思通过的最低分数
+    task_max_retries: int = 2
+    task_initial_backoff_seconds: float = 0.5
+    task_retry_backoff_cap_seconds: float = 5.0
+    task_max_workers: int = 4
+    task_timeout_seconds: int = 20
+    enable_fallback_chain: bool = True
+    # --- Embedding 配置 ---
+    embedding_model: str = "text-embedding-v3"
+    embedding_dimensions: int = 1024
+
+    # --- ChromaDB 向量库配置 ---
+    chroma_collection_name: str = "alert_knowledge"
+    chroma_persist_directory: str = "./data/chroma_db"
+
+    # --- 文档切块配置 ---
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+
+    # ============== 新增：LangSmith 配置（3行） ==============
+    # --- LangSmith 配置 ---
+    langsmith_tracing: bool = True
+    langsmith_api_key: str = ""
+    langsmith_project: str = "enterprise-alert-agent"
+    # ================================================
+
+    # --- 检索与重排配置 ---
+    retrieval_top_k: int = 8
+    context_top_k: int = 3
+    rerank_enabled: bool = True
+    rerank_model: str = "ms-marco-MiniLM-L-12-v2"
+    # 混合检索配置
+    retrieval_candidate_k: int = 12  # 初始召回
+    retrieval_final_k: int = 4  # 最终给上下文
+    retrieval_min_score: float = 0.45  # 过滤阈值
+    retrieval_hybrid_alpha: float = 0.7  # 稠密分占比
+    retrieval_query_rewrite: bool = True
+    retrieval_max_history_turns: int = 2
+    retrieval_query_rewrite_enabled: bool = True
+    retrieval_use_bm25: bool = True  # 关闭则退化为纯稠密
+    # 单次请求内所有 LLM 调用的累计 token 上限
+    max_tokens_per_request: int = 50000
+    # --- 上下文工程 / Token 预算 ---
+    llm_input_token_budget: int = 12000
+    llm_output_token_budget: int = 2048
+
+    context_history_token_budget: int = 3000
+    context_retrieval_token_budget: int = 5000
+    context_tool_result_token_budget: int = 3000
+
+    metrics_max_requests: int = 10000
+    metrics_max_latency_samples_per_request: int = 100
+    ingest_max_text_bytes: int = 1 * 1024 * 1024
+    ingest_max_file_bytes: int = 10 * 1024 * 1024
+    vector_db_path: str = "./data/vectorstore"
+    sqlite_path: str = "./data/app.db"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    @model_validator(mode="after")
+    def populate_pg_settings_from_checkpoint_dsn(self) -> "Settings":
+        if self.pg_host or not self.langgraph_checkpoint_dsn:
+            return self
+
+        checkpoint_url = make_url(self.langgraph_checkpoint_dsn)
+        if checkpoint_url.get_backend_name() != "postgresql":
+            return self
+
+        self.pg_host = checkpoint_url.host or ""
+        self.pg_port = checkpoint_url.port or self.pg_port
+        self.pg_user = checkpoint_url.username or self.pg_user
+        self.pg_password = checkpoint_url.password or self.pg_password
+        self.pg_db = checkpoint_url.database or self.pg_db
+        return self
+
+    # mysql数据库配置
+    mysql_host: str = ""
+    mysql_port: int = 3306
+    mysql_db: str = "agent"
+    mysql_user: str = "root"
+    mysql_password: str = ""
+    sql_max_rows: int = 200
+    sql_query_timeout_seconds: int = 5
+
+    # --- Time / Clock Tool 配置 ---
+    app_timezone: str = "Asia/Shanghai"
+    time_tool_enabled: bool = True
+    time_query_skip_retrieval: bool = True
+    time_query_skip_memory_write: bool = True
+    # redis配置
+    redis_host: str = ""
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_password: str = ""
+    memory_redact_pii: bool = True
+    memory_ttl_days: int = 7
+    redis_cache_ttl_seconds: int = 3600
+    ingest_idempotency_ttl_seconds: int = 600  # 幂等键保留时长，需覆盖客户端重试窗口
+    memory_summary_update_turn_threshold: int = 5
+    cache_recent_turns_limit: int = 10
+    # PostgreSQL 配置（替代 MySQL）
+    pg_host: str = ""
+    pg_port: int = 5432
+    pg_db: str = "postgres"
+    pg_user: str = "postgres"
+    pg_password: str = ""
+    pg_ssl_mode: str = "prefer"
+    langgraph_checkpoint_dsn: str = ""
+    # --- MCP 配置 ---
+    mcp_service_url: str = ""
+    mcp_enabled: bool = True
+    mcp_connect_timeout_seconds: float = 5.0  # 建立会话/握手超时
+    mcp_call_timeout_seconds: float = 60.0  # 单次工具调用超时
+    mcp_max_attempts: int = 2
+    mcp_idempotent_tools: list[str] = Field(default_factory=list)
+    mcp_api_key: str = ""
+    mcp_cookie: str = ""
+    # ========== 故障诊断配置==========
+    fault_diagnosis_enabled: bool = True
+    fault_alert_threshold: str = "high"  # "low", "medium", "high", "critical"
+    fault_recovery_auto_retry: bool = True
+    fault_recovery_wait_strategies: dict = {
+        "immediate": 0.1,
+        "wait_10s": 10.0,
+        "wait_30s": 30.0,
+    }
+    # ========== 安全配置==========
+    admin_jwt_secret: str = ""
+    # 轮换期内保留的上一把密钥：验证时新旧皆可，签发始终用 admin_jwt_secret
+    admin_jwt_secret_previous: str = ""
+    admin_jwt_algorithm: str = "HS256"
+    # user_id -> {api_key_hash, role, tenant_id}，签发时角色/租户以此为准，拒绝客户端自报值
+    admin_principals: dict[str, dict[str, str]] = Field(default_factory=dict)
+    max_concurrent_requests: int = 100
+    graceful_shutdown_timeout_seconds: float = 30.0
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_recovery_seconds: float = 30.0
+    alert_webhook_url: str = ""
+    alert_webhook_timeout_seconds: float = 5.0
+    alert_webhook_max_attempts: int = 3
+    alert_webhook_retry_backoff_seconds: float = 0.5
+    alert_webhook_retry_backoff_cap_seconds: float = 5.0
+    rate_limit_storage_uri: str = "memory://"
+    rate_limit_chat: str = "10/minute"
+    rate_limit_write: str = "5/minute"
+    rate_limit_read: str = "30/minute"
+
+
+def _validate_secrets(s: "Settings") -> None:
+    if s.app_env.lower() == "dev" and not s.admin_jwt_secret:
+        s.admin_jwt_secret = secrets.token_urlsafe(32)
+        logger.warning(
+            "ADMIN_JWT_SECRET is unset; using an ephemeral key for this development process"
+        )
+
+    # fail fast if any required secret is missing
+    required = {
+        "ADMIN_JWT_SECRET": s.admin_jwt_secret,
+        "REDIS_PASSWORD": s.redis_password,
+        "PG_PASSWORD": s.pg_password,
+    }
+    if s.mysql_host:
+        required["MYSQL_PASSWORD"] = s.mysql_password
+    if s.llm_provider == "dashscope":
+        required["DASHSCOPE_API_KEY"] = s.dashscope_api_key
+    elif s.llm_provider == "openai":
+        required["OPENAI_API_KEY"] = s.openai_api_key
+    elif s.llm_provider == "anthropic":
+        required["ANTHROPIC_API_KEY"] = s.anthropic_api_key
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        print(
+            f"[FATAL] Missing required secrets: {missing}. "
+            "Set them via environment variables or .env file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+settings = Settings()
+_validate_secrets(settings)

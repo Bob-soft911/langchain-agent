@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>企业知识助手</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            padding: 20px 0;
+            color: #1a73e8;
+            font-size: 24px;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 0;
+        }
+
+        .tab-btn {
+            flex: 1;
+            padding: 12px 24px;
+            border: none;
+            background: #e8eaed;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 500;
+            transition: all 0.2s;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .tab-btn.active {
+            background: #fff;
+            color: #1a73e8;
+            box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.05);
+        }
+
+        .tab-content {
+            display: none;
+            background: #fff;
+            padding: 24px;
+            border-radius: 0 0 8px 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* 表单样式 */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            font-size: 14px;
+            color: #555;
+        }
+
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #1a73e8;
+        }
+
+        .form-group textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: #1a73e8;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #1557b0;
+        }
+
+        .btn-primary:disabled {
+            background: #94c4f7;
+            cursor: not-allowed;
+        }
+
+        /* 聊天区域 */
+        .chat-box {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            background: #fafafa;
+        }
+
+        .chat-msg {
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            max-width: 85%;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+
+        .chat-msg.user {
+            background: #e3f2fd;
+            margin-left: auto;
+            text-align: right;
+        }
+
+        .chat-msg.bot {
+            background: #fff;
+            border: 1px solid #eee;
+        }
+
+        .chat-msg .citations {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #eee;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .chat-input-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .chat-input-row input {
+            flex: 1;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .chat-input-row input:focus {
+            outline: none;
+            border-color: #1a73e8;
+        }
+
+        .chat-meta-row {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .chat-meta-row input {
+            width: 100%;
+            padding: 9px 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .chat-meta-row input:focus {
+            outline: none;
+            border-color: #1a73e8;
+        }
+
+        .chat-action-row {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-bottom: 10px;
+        }
+
+        .btn-ghost {
+            background: #fff;
+            color: #1a73e8;
+            border: 1px solid #bbdefb;
+        }
+
+        .btn-ghost:hover {
+            background: #eef5ff;
+        }
+
+        /* 结果/状态显示 */
+        .result-box {
+            margin-top: 16px;
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            line-height: 1.6;
+            display: none;
+        }
+
+        .result-box.success {
+            background: #e8f5e9;
+            border: 1px solid #c8e6c9;
+            color: #2e7d32;
+            display: block;
+        }
+
+        .result-box.error {
+            background: #fce4ec;
+            border: 1px solid #f8bbd0;
+            color: #c62828;
+            display: block;
+        }
+
+        .result-box.info {
+            background: #e3f2fd;
+            border: 1px solid #bbdefb;
+            color: #1565c0;
+            display: block;
+        }
+
+        /* 统计信息 */
+        .stats-bar {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            background: #f0f4ff;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #555;
+        }
+
+        .stats-bar span {
+            font-weight: 600;
+            color: #1a73e8;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #ddd;
+            border-top-color: #1a73e8;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-left: 8px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🔔 RFP助手</h1>
+
+        <div class="stats-bar" id="statsBar">
+            向量库文档数：<span id="docCount">加载中...</span>
+        </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('chat')">💬 智能问答</button>
+            <button class="tab-btn" onclick="switchTab('ingest')">📄 文档摄入</button>
+        </div>
+
+        <!-- 问答 Tab -->
+        <div class="tab-content active" id="tab-chat">
+            <div class="chat-meta-row">
+                <input type="text" id="tenantIdInput" placeholder="tenant_id（默认 demo-tenant）">
+                <input type="text" id="userIdInput" placeholder="user_id（默认 demo-user）">
+                <input type="text" id="bizContextInput" placeholder="business_context（可留空）">
+            </div>
+            <div class="chat-action-row">
+                <button class="btn btn-ghost" id="clearMemoryBtn" onclick="clearChatMemory()">清空当前会话记忆</button>
+            </div>
+            <div class="chat-box" id="chatBox">
+                <div class="chat-msg bot">你好！我是企业知识助手，请输入你的问题。</div>
+            </div>
+            <div class="chat-input-row">
+                <input type="text" id="chatInput" placeholder="输入问题，如：高优先级告警如何处理？"
+                    onkeydown="if(event.key==='Enter')sendChat()">
+                <button class="btn btn-primary" id="chatBtn" onclick="sendChat()">发送</button>
+            </div>
+        </div>
+
+        <!-- 摄入 Tab -->
+        <div class="tab-content" id="tab-ingest">
+            <div class="form-group">
+                <label>选择文件（支持 txt / md / json / csv）</label>
+                <input type="file" id="fileInput" accept=".txt,.md,.json,.csv,.log">
+            </div>
+
+            <div class="form-group">
+                <label>文档来源标识 (source_id，可选，不填则默认用文件名)</label>
+                <input type="text" id="sourceId" placeholder="如：alert-rule-001">
+            </div>
+
+            <div class="form-group">
+                <label>分类标签（可选）</label>
+                <input type="text" id="category" placeholder="如：告警规则、监控阈值">
+            </div>
+
+            <div class="form-group">
+                <label>手工文本摄入（可选）</label>
+                <textarea id="docContent" placeholder="如果不上传文件，也可以直接粘贴文本到这里..."></textarea>
+            </div>
+
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="btn btn-primary" id="uploadBtn" onclick="ingestFile()">上传文件入库</button>
+                <button class="btn btn-primary" id="ingestBtn" onclick="ingestText()">提交文本摄入</button>
+            </div>
+
+            <div class="result-box" id="ingestResult"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        const CHAT_THREAD_KEY = "chat_thread_id";
+        const CHAT_SCOPE_KEY = "chat_scope";
+        const AUTH_TOKEN_KEY = "enterprise_alert_agent_token";
+        const AUTH_CONFIG = {
+            user_id: "demo-user",
+            api_key: "local-evaluation-admin-key",
+        };
+
+        async function requestToken() {
+            const res = await fetch(`${API_BASE}/admin/token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(AUTH_CONFIG),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.token) {
+                throw new Error(formatApiError(data) || '获取认证 token 失败');
+            }
+            localStorage.setItem(AUTH_TOKEN_KEY, data.token);
+            return data.token;
+        }
+
+        async function getAuthToken(forceRefresh = false) {
+            if (!forceRefresh) {
+                const cachedToken = localStorage.getItem(AUTH_TOKEN_KEY);
+                if (cachedToken) return cachedToken;
+            }
+            return requestToken();
+        }
+
+        async function authenticatedFetch(url, options = {}, retry = true) {
+            const token = await getAuthToken();
+            const headers = new Headers(options.headers || {});
+            headers.set('Authorization', `Bearer ${token}`);
+            const res = await fetch(url, { ...options, headers });
+            if (res.status === 401 && retry) {
+                const body = await res.clone().json().catch(() => ({}));
+                if (body.error && body.error.code === 'AUTH_INVALID_TOKEN') {
+                    localStorage.removeItem(AUTH_TOKEN_KEY);
+                    return authenticatedFetch(url, options, false);
+                }
+            }
+            return res;
+        }
+
+        function getChatScope() {
+            let scope = { tenant_id: "demo-tenant", user_id: "demo-user", business_context: "" };
+            try {
+                const raw = localStorage.getItem(CHAT_SCOPE_KEY);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    scope = {
+                        tenant_id: String(parsed.tenant_id || scope.tenant_id),
+                        user_id: String(parsed.user_id || scope.user_id),
+                        business_context: String(parsed.business_context || ""),
+                    };
+                }
+            } catch (e) {
+                // Ignore broken local cache and fallback to defaults.
+            }
+            return scope;
+        }
+
+        function persistChatScope() {
+            const scope = {
+                tenant_id: (document.getElementById('tenantIdInput').value || '').trim() || 'demo-tenant',
+                user_id: (document.getElementById('userIdInput').value || '').trim() || 'demo-user',
+                business_context: (document.getElementById('bizContextInput').value || '').trim(),
+            };
+            localStorage.setItem(CHAT_SCOPE_KEY, JSON.stringify(scope));
+            return scope;
+        }
+
+        function initChatScope() {
+            const scope = getChatScope();
+            document.getElementById('tenantIdInput').value = scope.tenant_id;
+            document.getElementById('userIdInput').value = scope.user_id;
+            document.getElementById('bizContextInput').value = scope.business_context;
+
+            ['tenantIdInput', 'userIdInput', 'bizContextInput'].forEach((id) => {
+                document.getElementById(id).addEventListener('blur', persistChatScope);
+            });
+        }
+
+        function formatApiError(data) {
+            const err = data && data.error;
+            if (!err) return formatErrorDetail(data && (data.detail || data));
+            const rid = err.request_id ? `（request_id: ${err.request_id}）` : '';
+            const hint = err.retryable ? '，可稍后重试' : '';
+            return `${err.message || '请求失败'}${hint}${rid}`;
+        }
+
+        function formatErrorDetail(detail) {
+            if (!detail) return '请求失败';
+            if (typeof detail === 'string') return detail;
+            if (Array.isArray(detail)) {
+                return detail.map((item) => {
+                    if (typeof item === 'string') return item;
+                    const loc = Array.isArray(item.loc) ? item.loc.join('.') : '';
+                    const msg = item.msg || JSON.stringify(item);
+                    return loc ? `${loc}: ${msg}` : msg;
+                }).join('；');
+            }
+            if (typeof detail === 'object') {
+                return detail.msg || JSON.stringify(detail);
+            }
+            return String(detail);
+        }
+
+        function getThreadId() {
+            let id = localStorage.getItem(CHAT_THREAD_KEY);
+            if (!id) {
+                id = (window.crypto && window.crypto.randomUUID)
+                    ? window.crypto.randomUUID()
+                    : String(Date.now());
+                localStorage.setItem(CHAT_THREAD_KEY, id);
+            }
+            return id;
+        }
+
+        // --- Tab 切换 ---
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+                btn.classList.toggle('active', (tab === 'chat' && i === 0) || (tab === 'ingest' && i === 1));
+            });
+            document.getElementById('tab-chat').classList.toggle('active', tab === 'chat');
+            document.getElementById('tab-ingest').classList.toggle('active', tab === 'ingest');
+        }
+
+        // --- 加载统计 ---
+        async function loadStats() {
+            try {
+                const res = await authenticatedFetch(`${API_BASE}/ingest/stats`);
+                const data = await res.json();
+                document.getElementById('docCount').textContent = res.ok
+                    ? data.total_documents
+                    : '认证失败';
+            } catch (e) {
+                document.getElementById('docCount').textContent = '无法连接';
+            }
+        }
+
+        // --- 问答 ---
+        async function sendChat() {
+            const input = document.getElementById('chatInput');
+            const query = input.value.trim();
+            if (!query) return;
+            const scope = persistChatScope();
+
+            const chatBox = document.getElementById('chatBox');
+            const btn = document.getElementById('chatBtn');
+
+            // 显示用户消息
+            chatBox.innerHTML += `<div class="chat-msg user">${escapeHtml(query)}</div>`;
+            input.value = '';
+            btn.disabled = true;
+            btn.innerHTML = '发送中<span class="loading"></span>';
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            const botBubble = document.createElement('div');
+            botBubble.className = 'chat-msg bot';
+            chatBox.appendChild(botBubble);
+
+            let answerText = '';
+            let citationsHtml = '';
+
+            try {
+                const res = await authenticatedFetch(`${API_BASE}/chat/stream`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query,
+                        business_context: scope.business_context,
+                        thread_id: getThreadId(),
+                        tenant_id: scope.tenant_id,
+                        user_id: scope.user_id,
+                    }),
+                });
+
+                if (!res.ok || !res.body) {
+                    const data = await res.json().catch(() => ({}));
+                    const errMsg = formatApiError(data);
+                    botBubble.innerHTML = `<span style="color:#c62828">❌ 错误：${escapeHtml(errMsg)}</span>`;
+                    return;
+                }
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const frames = buffer.split('\n\n');
+                    buffer = frames.pop() || '';
+
+                    for (const frame of frames) {
+                        const line = frame.trim();
+                        if (!line.startsWith('data: ')) continue;
+                        const payloadText = line.slice(6);
+
+                        let payload = null;
+                        try {
+                            payload = JSON.parse(payloadText);
+                        } catch {
+                            continue;
+                        }
+
+                        if (payload.type === 'token') {
+                            answerText += String(payload.content || '');
+                            botBubble.textContent = answerText;
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        } else if (payload.type === 'done') {
+                            const citations = Array.isArray(payload.citations) ? payload.citations : [];
+                            if (citations.length > 0) {
+                                citationsHtml = '<div class="citations">📎 引用来源：' +
+                                    citations.map(c => `[${escapeHtml(c.source_id)}]`).join(' ') +
+                                    '</div>';
+                            }
+                            botBubble.innerHTML = `${escapeHtml(answerText || String(payload.answer || ''))}${citationsHtml}`;
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        } else if (payload.type === 'error') {
+                            const rid = payload.request_id ? `（request_id: ${payload.request_id}）` : '';
+                            const hint = payload.retryable ? '，可稍后重试' : '';
+                            botBubble.innerHTML = `<span style="color:#c62828">❌ 错误：${escapeHtml((payload.message || '请求失败') + hint + rid)}</span>`;
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                    }
+                }
+            } catch (e) {
+                botBubble.innerHTML = `<span style="color:#c62828">❌ 网络错误：${escapeHtml(e.message)}</span>`;
+            }
+
+            btn.disabled = false;
+            btn.textContent = '发送';
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        async function clearChatMemory() {
+            const scope = persistChatScope();
+            const btn = document.getElementById('clearMemoryBtn');
+            btn.disabled = true;
+            btn.innerHTML = '清理中<span class="loading"></span>';
+
+            try {
+                const res = await authenticatedFetch(`${API_BASE}/chat/memory/clear`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        tenant_id: scope.tenant_id,
+                        user_id: scope.user_id,
+                        thread_id: getThreadId(),
+                    }),
+                });
+                const data = await res.json();
+                const chatBox = document.getElementById('chatBox');
+                if (res.ok) {
+                    localStorage.removeItem(CHAT_THREAD_KEY);
+                    chatBox.innerHTML += `<div class="chat-msg bot">🧹 ${escapeHtml(data.message || '会话记忆已清空')}</div>`;
+                } else {
+                    chatBox.innerHTML += `<div class="chat-msg bot" style="color:#c62828">❌ 清理失败：${escapeHtml(formatApiError(data))}</div>`;
+                }
+                chatBox.scrollTop = chatBox.scrollHeight;
+            } catch (e) {
+                const chatBox = document.getElementById('chatBox');
+                chatBox.innerHTML += `<div class="chat-msg bot" style="color:#c62828">❌ 清理失败：${escapeHtml(e.message)}</div>`;
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
+
+            btn.disabled = false;
+            btn.textContent = '清空当前会话记忆';
+        }
+
+        // --- 文档摄入 ---
+        // --- 文件上传摄入 ---
+        async function ingestFile() {
+            const fileInput = document.getElementById('fileInput');
+            const sourceId = document.getElementById('sourceId').value.trim();
+            const category = document.getElementById('category').value.trim();
+            const resultBox = document.getElementById('ingestResult');
+            const btn = document.getElementById('uploadBtn');
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                resultBox.className = 'result-box error';
+                resultBox.textContent = '请先选择一个文件';
+                return;
+            }
+
+            const file = fileInput.files[0];
+            btn.disabled = true;
+            btn.innerHTML = '上传中<span class="loading"></span>';
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('source_id', sourceId);
+            formData.append('category', category);
+
+            try {
+                const res = await authenticatedFetch(`${API_BASE}/ingest/file`, {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await res.json();
+
+                if (res.ok) {
+                    resultBox.className = 'result-box success';
+                    resultBox.textContent = `✅ ${data.message}（切块数：${data.chunks_count}，向量库总数：${data.total_docs}）`;
+                    loadStats();
+                    fileInput.value = '';
+                    document.getElementById('sourceId').value = '';
+                    document.getElementById('category').value = '';
+                } else {
+                    resultBox.className = 'result-box error';
+                    resultBox.textContent = `❌ 错误：${formatApiError(data)}`;
+                }
+            } catch (e) {
+                resultBox.className = 'result-box error';
+                resultBox.textContent = `❌ 网络错误：${e.message}`;
+            }
+
+            btn.disabled = false;
+            btn.textContent = '上传文件入库';
+        }
+
+        // --- 文本摄入 ---
+        async function ingestText() {
+            const sourceId = document.getElementById('sourceId').value.trim() || 'manual-text';
+            const content = document.getElementById('docContent').value.trim();
+            const category = document.getElementById('category').value.trim();
+            const resultBox = document.getElementById('ingestResult');
+            const btn = document.getElementById('ingestBtn');
+
+            if (!content) {
+                resultBox.className = 'result-box error';
+                resultBox.textContent = '请填写文档内容';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '提交中<span class="loading"></span>';
+
+            const body = {
+                content,
+                source_id: sourceId,
+                metadata: {},
+            };
+            if (category) body.metadata.category = category;
+
+            try {
+                const res = await authenticatedFetch(`${API_BASE}/ingest/text`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+
+                if (res.ok) {
+                    resultBox.className = 'result-box success';
+                    resultBox.textContent = `✅ ${data.message}（切块数：${data.chunks_count}，向量库总数：${data.total_docs}）`;
+                    loadStats();
+                    document.getElementById('docContent').value = '';
+                } else {
+                    resultBox.className = 'result-box error';
+                    resultBox.textContent = `❌ 错误：${formatApiError(data)}`;
+                }
+            } catch (e) {
+                resultBox.className = 'result-box error';
+                resultBox.textContent = `❌ 网络错误：${e.message}`;
+            }
+
+            btn.disabled = false;
+            btn.textContent = '提交文本摄入';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // 页面加载时获取统计
+        initChatScope();
+        getAuthToken().then(loadStats).catch((error) => {
+            document.getElementById('docCount').textContent = '认证失败';
+            console.error('认证失败:', error);
+        });
+    </script>
+</body>
+
+</html>

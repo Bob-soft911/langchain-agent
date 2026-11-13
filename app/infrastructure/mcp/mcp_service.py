@@ -1,0 +1,254 @@
+import asyncio
+import logging
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
+
+from app.config.settings import settings
+from app.infrastructure.fault.circuit_breaker import CircuitBreaker, CircuitOpenError
+from app.infrastructure.fault.retry_policy import backoff_delay
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CallRequest:
+    tool_name: str
+    tool_args: dict[str, Any]
+    future: "asyncio.Future[dict[str, Any]]" = field(compare=False)
+
+
+class RemoteMCPClient:
+    def __init__(self) -> None:
+        self._tools_meta: list[dict[str, Any]] = []
+        self._initialized = False
+        self._session: ClientSession | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        # self._call_lock = asyncio.Lock()  # 同一会话不支持并发重入，串行化调用
+        self._queue: asyncio.Queue[_CallRequest | None] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self._circuit_breaker = CircuitBreaker(
+            name="mcp",
+            failure_threshold=settings.circuit_breaker_failure_threshold,
+            recovery_seconds=settings.circuit_breaker_recovery_seconds,
+        )
+
+    async def _do_connect(self) -> bool:
+        try:
+            # 用 AsyncExitStack 手动管理生命周期，session 在 initialize() 之后继续存活，供 call_tool 复用
+            headers: dict[str, str] = {}
+            if settings.mcp_api_key:
+                headers["X-Access-Key"] = settings.mcp_api_key
+            if settings.mcp_cookie:
+                headers["Cookie"] = settings.mcp_cookie
+            # 发送请求到 MCP 服务，获取工具元信息
+            stack = AsyncExitStack()
+            http_client = await stack.enter_async_context(
+                create_mcp_http_client(
+                    headers=headers, timeout=httpx.Timeout(settings.mcp_connect_timeout_seconds)
+                )
+            )
+            read, write, _ = await stack.enter_async_context(
+                streamable_http_client(url=settings.mcp_service_url, http_client=http_client)
+            )
+            session = await stack.enter_async_context(
+                ClientSession(read_stream=read, write_stream=write)
+            )
+            await asyncio.wait_for(
+                session.initialize(), timeout=settings.mcp_connect_timeout_seconds
+            )
+
+            tools_results = await session.list_tools()
+            self._tools_meta = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema or {},
+                    },
+                }
+                for tool in tools_results.tools
+            ]
+            self._initialized = True
+            self._session = session
+            self._exit_stack = stack
+            logger.info("MCP client initialized successfully with %d tools", len(self._tools_meta))
+            return True
+        except (
+            httpx.HTTPError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+        ):
+            logger.exception("MCP client initialization failed")
+            return False
+
+    # MCP Session Worker 单工作线程队列模型 核心精简文档.md
+    async def initialize(self) -> bool:
+        if self._worker_task is not None:
+            return self._initialized
+        self._queue = asyncio.Queue()
+        ready: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._worker_task = asyncio.create_task(self._run(ready))
+        return await ready
+
+    async def _run(self, ready: asyncio.Future[bool]) -> None:
+        try:
+            connected = await self._do_connect()
+            if not ready.done():
+                ready.set_result(connected)
+            if not connected or self._queue is None:
+                return
+            while True:
+                request = await self._queue.get()
+                if request is None:
+                    break
+                try:
+                    response = await self._handle_request(request.tool_name, request.tool_args)
+                except Exception as exc:
+                    logger.exception("MCP request crashed: tool=%s", request.tool_name)
+                    response = {
+                        "status": "error",
+                        "data": [],
+                        "row_count": 0,
+                        "error_code": "mcp_internal_error",
+                        "message": str(exc),
+                    }
+                if request.future and not request.future.done():
+                    request.future.set_result(response)
+        except (Exception, BaseExceptionGroup):
+            logger.exception("MCP worker failed")
+        finally:
+            if not ready.done():
+                ready.set_result(False)
+            await self._shutdown_worker_resources()
+            self._worker_task = None
+
+    async def _handle_request(
+        self, tool_name: str, tool_args: dict[str, Any], *, max_attempts: int | None = None
+    ) -> dict[str, Any]:
+        max_attempts = max_attempts or settings.mcp_max_attempts
+        retry_safe = tool_name in settings.mcp_idempotent_tools
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            request_sent = False
+            try:
+                session = self._session
+                if session is None or self._exit_stack is None:
+                    if not await self._do_connect() or not self._session:
+                        raise ConnectionError("Failed to connect to MCP server")
+                    session = self._session
+                request_sent = True  # 从这里开始，服务端可能已经执行了工具
+                result = await asyncio.wait_for(
+                    session.call_tool(name=tool_name, arguments=tool_args),
+                    timeout=settings.mcp_call_timeout_seconds,
+                )
+                return self._format_tool_result(result)
+            except (
+                AttributeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                last_exc = exc  # 代码或参数错误，重试也没用
+                break  # 不可重试的错误，直接退出循环
+            except (ConnectionError, OSError, RuntimeError, TimeoutError) as exc:
+                # 会话可能已损坏（比如连接被对端关闭），标记为未初始化，下一轮循环触发重连
+                last_exc = exc
+                await self._reset_session()
+                if request_sent and not retry_safe:
+                    logger.warning("MCP tool %s not idempotent, skip retry: %s", tool_name, exc)
+                    break
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff_delay(attempt - 1, base=0.2, cap=2.0))
+        return {
+            "status": "error",
+            "data": [],
+            "row_count": 0,
+            "error_code": "timeout" if isinstance(last_exc, TimeoutError) else "mcp_call_failed",
+            "message": str(last_exc),
+        }
+
+    async def call_tool(self, tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            self._circuit_breaker.before_call()
+        except CircuitOpenError:
+            logger.warning("MCP circuit open, blocking tool call: %s", tool_name)
+            return {
+                "status": "error",
+                "data": [],
+                "row_count": 0,
+                "error_code": "circuit_open",
+                "message": "MCP circuit is open, tool call blocked",
+            }
+        if self._queue is None or self._worker_task is None:
+            self._circuit_breaker.record_failure()
+            return {
+                "status": "error",
+                "data": [],
+                "row_count": 0,
+                "error_code": "not_initialized",
+                "message": "MCP service is not initialized",
+            }
+        function: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        await self._queue.put(_CallRequest(tool_name, tool_args, function))
+        result = await function
+        if result.get("status") == "success":
+            self._circuit_breaker.record_success()
+        else:
+            self._circuit_breaker.record_failure()
+
+        return result
+
+    def get_tools_metadata(self) -> list[dict[str, Any]]:
+        return self._tools_meta
+
+    async def _shutdown_worker_resources(self) -> None:
+        try:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+        except (AttributeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            logger.warning("Error closing exit stack: %s", exc)
+        finally:
+            self._session = None
+            self._tools_meta = []
+            self._initialized = False
+            self._exit_stack = None
+
+    async def close(self) -> None:
+        if self._queue is None or self._worker_task is None:
+            return
+        await self._queue.put(None)
+        await self._worker_task
+
+    def _format_tool_result(self, result: Any) -> dict[str, Any]:
+        content = result.content
+        if isinstance(content, list) and content:
+            texts = [getattr(item, "text", str(item)) for item in content if item is not None]
+            return {
+                "status": "success",
+                "data": [{"result": "\n".join(texts)}],
+                "row_count": len(content),
+                "error_code": "",
+                "message": "ok",
+            }
+        return {"status": "success", "data": [], "row_count": 0, "error_code": "", "message": "ok"}
+
+    async def _reset_session(self) -> None:
+        self._initialized = False
+        try:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+        except (AttributeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            logger.warning("Error closing MCP session: %s", exc)
+        finally:
+            self._session = None
+            self._exit_stack = None

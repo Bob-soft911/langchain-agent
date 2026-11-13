@@ -1,0 +1,268 @@
+"""检索器 - 从向量库中检索相关文档。
+
+升级后使用 ChromaDB 做真实的语义相似度检索，
+如果向量库为空则回退到内存假数据（兼容开发阶段）。
+"""
+
+import json
+import logging
+import threading
+from copy import deepcopy
+from threading import RLock
+from typing import TYPE_CHECKING, Any
+
+import jieba
+from langsmith import RunTree
+
+from app.config.settings import settings
+from app.infrastructure.vectorstore.chroma_store import ChromaStore
+from app.observability.langsmith_tracer import LangSmithTracer
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from flashrank import Ranker as RankerType
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    logger.warning(
+        "rank_bm25 模块未安装，检索器将无法使用 BM25 功能。请安装 rank_bm25 以启用 BM25 检索。"
+    )
+    BM25Okapi = None
+
+try:
+    from flashrank import Ranker, RerankRequest
+except ImportError:
+    logger.warning(
+        "flashrank 模块未安装，检索器将无法使用 rerank 功能。请安装 flashrank 以启用 rerank 检索。"
+    )
+    Ranker = None
+    RerankRequest = None
+
+_reranker_cache: dict[str, "RankerType"] = {}  # 全局缓存，避免重复创建 Ranker 实例
+_reranker_lock = threading.Lock()
+
+
+def _get_reranker(model_name: str) -> "RankerType | None":
+    if Ranker is None:
+        return None
+    with _reranker_lock:
+        if model_name not in _reranker_cache:
+            _reranker_cache[model_name] = Ranker(model_name)
+        return _reranker_cache[model_name]
+
+
+class Retriever:
+    """混合检索器，支持向量检索和基于规则的回退机制。"""
+
+    def __init__(self, chroma_store: ChromaStore, tracer: LangSmithTracer) -> None:
+        self._store = chroma_store
+        self._tracer = tracer  # 新增：保存 tracer 实例
+        self._query_cache: dict[str, list[dict]] = {}  # 简单的查询缓存，避免重复查询同一问题
+        self._cache_max_size = 100
+        self._cache_lock = RLock()
+
+    # 参考文档:RAG混合检索完整技术文档（Chroma+BM25+Jieba分词+RRF融合）
+    def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+        *,
+        history_text: str = "",
+        where: dict[str, Any] | None = None,
+        parent_run: RunTree | None = None,
+    ) -> list[dict[str, str]]:
+        # 创建 retriever 层的子 run
+        run = self._tracer.start_child(
+            parent_run=parent_run,
+            name="rag.retrieve",
+            run_type="retriever",
+            inputs={"query": query, "top_k": top_k},
+            tags=["rag", "retriever"],
+        )
+        where_key = json.dumps(where, sort_keys=True, ensure_ascii=False, default=str)
+        store_revision = self._store.count()
+        cache_key = f"{query}|{history_text}|{top_k}|{where_key}|{store_revision}"
+        with self._cache_lock:
+            cached_docs = self._query_cache.get(cache_key)
+            if cached_docs is not None:
+                cached_docs = deepcopy(cached_docs)
+        if cached_docs is not None:
+            self._tracer.end_run(run, outputs={"hits": len(cached_docs), "mode": "cache"})
+            logger.debug("Cache hit for query: %s", query[:50])
+            return cached_docs
+        try:
+            if self._store.count() == 0:
+                self._tracer.end_run(run, outputs={"hits": 0, "mode": "fallback"})
+                return []
+            # 查询重写（Query Rewriting）
+            rewritten_query = self._rewrite_query(query, history_text)
+            candidate_k = max(settings.retrieval_candidate_k, (top_k or settings.retrieval_final_k))
+            # candidates = self._store.query(
+            #     rewritten_query, top_k=candidate_k, where=where, parent_run=run
+            # )  # 传递 parent_run 以便在向量库查询中记录路径
+            # if not candidates:
+            #     self._tracer.end_run(run, outputs={"hits": 0, "mode": "empty"})
+            #     return []
+
+            # # RAG 混合检索（Hybrid Search + 重排）
+            # reranked = self._hybrid_rerank(rewritten_query, candidates)
+            # filtered = [doc for doc in reranked if doc["score"] >= settings.retrieval_min_score]
+            dense_docs = self._store.query(
+                rewritten_query, top_k=candidate_k, where=where, parent_run=run
+            )
+            lexical_docs = (
+                (self._lexical_search(rewritten_query, top_k=candidate_k, where=where))
+                if settings.retrieval_use_bm25
+                else []
+            )
+            merged = self._rrf_merge(dense_docs, lexical_docs)
+            if settings.rerank_enabled and merged:
+                merged = self._flashrank_rerank(rewritten_query, merged)
+            final_docs = merged[: top_k or settings.retrieval_final_k]
+
+            self._tracer.end_run(
+                run,
+                outputs={
+                    "hits": len(final_docs),
+                    "candidate_k": candidate_k,
+                },
+            )
+            with self._cache_lock:
+                if len(self._query_cache) >= self._cache_max_size:
+                    oldest_cache_key = next(iter(self._query_cache))
+                    self._query_cache.pop(oldest_cache_key)
+                self._query_cache[cache_key] = deepcopy(final_docs)
+            logger.debug("Cache updated for query: %s", query[:50])
+            return deepcopy(final_docs)
+        except Exception as e:
+            # 异常路径也要记录
+            self._tracer.end_run(
+                run, outputs={"error": str(e)}, error=LangSmithTracer.format_error(e)
+            )
+            raise
+
+    def _rewrite_query(self, query: str, history_text: str) -> str:
+        if not settings.retrieval_query_rewrite or not history_text.strip():
+            return query
+        short_history = self._tail_turns(history_text, settings.retrieval_max_history_turns)
+        return f"{query}\n\n最近上下文:\n{short_history}"
+
+    # RAG 混合检索：稠密向量 + BM25（词法） 融合，再用 flashrank 重排
+    # def _hybrid_rerank(self, query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    #     # # 稠密分占比
+    #     alpha = float(settings.retrieval_hybrid_alpha)
+    #     lexical_bm25_scores = self._bm25_scores(query, docs)
+
+    #     merged: list[dict[str, Any]] = []
+    #     for doc, lexical_score in zip(docs, lexical_bm25_scores):
+    #         dense = float(doc.get("score", 0.0))  # 确保有 score 字段
+    #         lexical = lexical_score
+    #         hybrid = alpha * dense + (1 - alpha) * lexical
+    #         item = dict(doc)
+    #         item["dense_score"] = dense
+    #         item["lexical_score"] = lexical
+    #         item["score"] = hybrid
+    #         merged.append(item)
+    #     merged.sort(key=lambda d: d["score"], reverse=True)
+    #     merged = [mer for mer in merged if mer["score"] > settings.retrieval_min_score]
+    #     if settings.rerank_enabled and merged:
+    #         try:
+    #             merged = self._flashrank_rerank(query, merged)
+    #         except Exception:
+    #             logger.warning("flashrank rerank failed, fallback to hybrid score", exc_info=True)
+    #     return merged
+
+    @staticmethod
+    def _tail_turns(history_text: str, max_turns: int) -> str:
+        parts = history_text.split("\nUser: ")
+        turns = []
+        for idx, p in enumerate(parts):
+            p = p.strip()
+            if not p:
+                continue
+            turns.append(
+                ("User: " + p) if idx > 0 else (p if p.startswith("User: ") else "User: " + p)
+            )
+        return "\n".join(turns[-max_turns:])
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return [token.strip() for token in jieba.lcut(text.lower()) if token.strip()]
+
+    # @staticmethod
+    # def _bm25_scores(query: str, docs: list[dict[str, Any]]) -> list[float]:
+    #     if not settings.retrieval_use_bm25 or BM25Okapi is None:
+    #         return [0.0] * len(docs)
+    #     corpus = [Retriever._tokenize(str(doc.get("content", ""))) for doc in docs]
+    #     bm25 = BM25Okapi(corpus)
+    #     query_token = Retriever._tokenize(query)
+    #     raw_scores = list(bm25.get_scores(query_token))
+    #     max_score = max(raw_scores) if raw_scores else 0.0
+    #     if max_score <= 0.0:
+    #         return [0.0] * len(docs)
+    #     return [raw_score / max_score for raw_score in raw_scores]
+
+    @staticmethod
+    def _flashrank_rerank(query: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reranker = _get_reranker(settings.rerank_model)
+        if reranker is None or RerankRequest is None:
+            return docs
+        try:
+            passages = [
+                {"id": str(idx), "text": doc.get("content", "")} for idx, doc in enumerate(docs)
+            ]
+            rerank_request = RerankRequest(
+                query=query,
+                passages=passages,
+            )
+            rerank_results = reranker.rerank(rerank_request)
+            score_by_idx = {int(r["id"]): float(r["score"]) for r in rerank_results}
+            for idx, doc in enumerate(docs):
+                doc["rerank_score"] = score_by_idx.get(idx, doc.get("score"))
+            docs.sort(key=lambda d: d["rerank_score"], reverse=True)
+            return docs
+        except Exception:
+            logger.warning("flashrank rerank failed, fallback to hybrid score", exc_info=True)
+            return docs
+
+    def _lexical_search(
+        self, query: str, top_k: int = 3, where: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        if not settings.retrieval_use_bm25 or BM25Okapi is None:
+            return []
+        documents = list(self._store.iter_documents(where=where))
+        query_tokens = self._tokenize(query)
+        if not documents or not query_tokens:
+            return []
+        corpus = [self._tokenize(str(doc.get("content", ""))) for doc in documents]
+        if not corpus:
+            return []
+        scores = BM25Okapi(corpus).get_scores(query_tokens)  # type: ignore
+        query_terms = set(query_tokens)
+        matched = [idx for idx, tokens in enumerate(corpus) if query_terms.intersection(tokens)]
+        ranked = sorted(
+            matched,
+            key=lambda idx: scores[idx],
+            reverse=True,
+        )
+        return [documents[idx] for idx in ranked[:top_k]]
+
+    @staticmethod
+    def _rrf_merge(
+        dense_docs: list[dict[str, Any]],
+        lexical_docs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        if not dense_docs and not lexical_docs:
+            return []
+        k = 60  # Reciprocal Rank Fusion parameter
+        dense_weight = settings.retrieval_hybrid_alpha if settings.retrieval_use_bm25 else 1.0
+        for docs, weight in (
+            (dense_docs, dense_weight),
+            (lexical_docs, 1.0 - dense_weight),
+        ):
+            for rank, doc in enumerate(docs, start=1):
+                item = merged.setdefault(doc["id"], {**doc, "score": 0.0})
+                item["score"] += weight / (k + rank)
+        return sorted(merged.values(), key=lambda d: d["score"], reverse=True)
