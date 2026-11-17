@@ -64,6 +64,7 @@ from app.infrastructure.memory.redis_postgres_conversation_memory import (
     TaskStatus,
 )
 from app.infrastructure.queue.dlq_handler import dead_letter_queue
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.infrastructure.skill.registry import skill_registry
 from app.observability.alert_manager import AlertManager
 from app.observability.alert_types import AlertSeverity, AlertTypes
@@ -452,6 +453,8 @@ class ChatService:
                             task_id=failed_task_id,
                             reason="parallel_task_execution_failed。",
                             user_id=req.user_id,
+                            request_id=request_id,
+                            owner=ResourceOwner(scope="tenant", tenant_id=req.tenant_id),
                         )
             else:
                 if tool_selection and tool_selection.tool_name:
@@ -1467,8 +1470,11 @@ class ChatService:
                     task_id=subtask.task_id,
                     reason=root_cause,
                     user_id=state.active_agent_id if state else "system",
+                    request_id=request_id,
+                    owner=ResourceOwner(scope="tenant", tenant_id=history_scope.tenant_id),
                 )
                 self.alert_manager.create_alert(
+                    owner=ResourceOwner(scope="tenant", tenant_id=history_scope.tenant_id),
                     alert_type=AlertTypes.FAULT_ALERT,
                     severity=AlertSeverity.HIGH,
                     title=f"子任务 {subtask.task_id} 需要人工干预",

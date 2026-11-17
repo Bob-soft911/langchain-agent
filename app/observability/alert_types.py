@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from datetime import UTC, datetime
 from enum import Enum
 
@@ -32,6 +33,7 @@ class Alert:
     title: str  # 告警标题
     message: str  # 告警消息
     affected_resource: str  # 受影响资源（如 task_id, agent_id）
+    owner: ResourceOwner
     acknowledged_at: datetime | None = None
     context: dict = field(default_factory=dict)  # 上下文信息
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))

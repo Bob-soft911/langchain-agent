@@ -11,6 +11,7 @@ import httpx
 
 from app.config.settings import settings
 from app.infrastructure.fault.retry_policy import backoff_delay, is_retryable
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.observability.alert_types import Alert, AlertSeverity, AlertTypes
 from app.observability.prometheus_metrics import (
     ALERT_COUNT,
@@ -37,6 +38,8 @@ class AlertManager:
 
     def create_alert(
         self,
+        *,
+        owner: ResourceOwner,
         alert_type: AlertTypes,
         severity: AlertSeverity,
         title: str,
@@ -52,6 +55,7 @@ class AlertManager:
             title=title,
             message=message,
             affected_resource=affected_resource,
+            owner=owner,
             context=context or {},
         )
         with self._lock:

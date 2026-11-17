@@ -21,6 +21,7 @@ from pydantic.dataclasses import dataclass
 from redis import asyncio as redis_asyncio
 
 from app.config.settings import settings
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class DLQEntry:
     task_id: str
     payload: dict[str, Any]
     failure_reason: str
+    owner: ResourceOwner
     retry_count: int = 0
     max_retries: int = 3
     status: DLQStatus = DLQStatus.PENDING
@@ -60,6 +62,7 @@ class DLQEntry:
             task_id=data["task_id"],
             payload=data["payload"],
             failure_reason=data["failure_reason"],
+            owner=ResourceOwner(scope="tenant", tenant_id=data["owner"]["tenant_id"]),
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
             status=DLQStatus(data["status"]),
@@ -77,7 +80,7 @@ class DeadLetterQueue:
         self._lock = threading.Lock()
         self._entries: dict[str, DLQEntry] = {}
         self.redis = self._build_redis_client()
-        self._redis_index_key = "dlq:index"
+        self._redis_index_key
         self._worker_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
 
@@ -117,6 +120,11 @@ class DeadLetterQueue:
         """生成Redis键"""
         return f"dlq:entry:{dlq_id}"
 
+    def _redis_index_key(self, owner: ResourceOwner) -> str:
+        scope, tenant_id = owner.storage_key()
+        owner_id = tenant_id if tenant_id is not None else "platform"
+        return f"dlq:index:{owner_id}"
+
     async def _persist_entry(self, entry: DLQEntry) -> None:
         """将条目持久化到Redis"""
         if not self.redis:
@@ -126,8 +134,8 @@ class DeadLetterQueue:
             await self.redis.set(
                 self._entry_keys(entry.dlq_id), json.dumps(entry.to_dict(), ensure_ascii=False)
             )
-            await self.redis.sadd(self._redis_index_key, entry.dlq_id)
-            await self.redis.expire(self._redis_index_key, ttl_seconds)
+            await self.redis.sadd(self._redis_index_key(entry.owner), entry.dlq_id)
+            await self.redis.expire(self._redis_index_key(entry.owner), ttl_seconds)
             await self.redis.expire(self._entry_keys(entry.dlq_id), ttl_seconds)
         except (ConnectionError, TimeoutError, ValueError, redis_asyncio.RedisError) as e:
             logger.error(f"Failed to persist DLQ entry: {e}")
@@ -138,7 +146,9 @@ class DeadLetterQueue:
             return
         try:
             if self.redis:
-                dlq_ids = await self.redis.smembers(self._redis_index_key)
+                dlq_ids = await self.redis.smembers(
+                    self._redis_index_key(ResourceOwner(scope="tenant", tenant_id=""))
+                )
                 for dlq_id in dlq_ids:
                     str_dlq_id = cast(str, dlq_id)
                     entry_data = await self.redis.get(self._entry_keys(str_dlq_id))
@@ -158,6 +168,7 @@ class DeadLetterQueue:
                 payload=payload,
                 failure_reason=failure_reason,
                 max_retries=self.max_retries,
+                owner=ResourceOwner(scope="tenant", tenant_id=payload.get("tenant_id", "")),
             )
             self._entries[dlq_id] = entry
         await self._persist_entry(entry)

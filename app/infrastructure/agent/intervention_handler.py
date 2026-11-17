@@ -12,8 +12,11 @@ from app.infrastructure.agent.a2a_protocol import (
     ManualInterventionRequest,
     ManualInterventionResult,
 )
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 
 logger = logging.getLogger(__name__)
+
+InterventionKey = tuple[str, str | None, str]
 
 
 class InterventionHandler:
@@ -22,20 +25,27 @@ class InterventionHandler:
     def __init__(self) -> None:
         self.intervention_queue: dict[str, list] = {}
         # 添加干预历史存储
-        self.intervention_history: dict[str, list] = {}
-        self.pending_interventions: dict[str, list] = {}
+        self.intervention_history: dict[InterventionKey, list[ManualInterventionRequest]] = {}
+        self.pending_interventions: dict[InterventionKey, list[ManualInterventionRequest]] = {}
         self.intervention_results: dict[str, ManualInterventionResult] = {}
         self._lock = RLock()
 
     def create_intervention_request(
-        self, task_id: str, reason: str, user_id: str = "system"
+        self,
+        task_id: str,
+        reason: str,
+        user_id: str = "system",
+        *,
+        request_id: str,
+        owner: ResourceOwner,
     ) -> ManualInterventionRequest:
         """创建人工干预请求"""
         request = ManualInterventionRequest(
             task_id=task_id, intervention_type="pending", user_id=user_id
         )
         with self._lock:
-            self.pending_interventions.setdefault(request.task_id, []).append(request)
+            key = self._intervention_key(owner, request_id)
+            self.pending_interventions.setdefault(key, []).append(request)
         logger.info(f"Created intervention request for task {task_id} with reason: {reason}")
         return request
 
@@ -44,6 +54,9 @@ class InterventionHandler:
         task_id: str,
         request: ManualInterventionRequest,
         execute_callback: Callable[[dict[str, Any]], Any] | None = None,
+        *,
+        request_id: str,
+        owner: ResourceOwner,
     ) -> ManualInterventionResult:
         intervention_id = f"intervention_{task_id}_{uuid.uuid4().hex[:8]}"
         started = time.perf_counter()
@@ -140,8 +153,9 @@ class InterventionHandler:
             )
         finally:
             with self._lock:
-                self.intervention_history.setdefault(request.task_id, []).append(deepcopy(request))
-                self.pending_interventions.pop(request.task_id, None)
+                key = self._intervention_key(owner, request_id)
+                self.intervention_history.setdefault(key, []).append(deepcopy(request))
+                self.pending_interventions.pop(key, None)
                 self.intervention_results.setdefault(
                     intervention_id,
                     ManualInterventionResult(
@@ -153,27 +167,39 @@ class InterventionHandler:
                     ),
                 )
 
-    def get_pending_intervention(self, request_id: str) -> list:
+    def get_pending_intervention(self, request_id: str, owner: ResourceOwner) -> list:
         """获取待处理的干预请求"""
         with self._lock:
-            return deepcopy(self.pending_interventions.get(request_id, []))
+            key = self._intervention_key(owner, request_id)
+            return deepcopy(self.pending_interventions.get(key, []))
 
-    def get_intervention_history(self, request_id: str) -> list:
+    def _intervention_key(self, owner: ResourceOwner, request_id: str) -> InterventionKey:
+        scope, tenant_id = owner.storage_key()
+        return scope, tenant_id, request_id
+
+    def get_intervention_history(self, request_id: str, owner: ResourceOwner) -> list:
         """获取干预历史"""
         with self._lock:
-            return deepcopy(self.intervention_history.get(request_id, []))
+            key = self._intervention_key(owner, request_id)
+            return deepcopy(self.intervention_history.get(key, []))
 
-    def add_pending_intervention(self, request_id: str, request: ManualInterventionRequest):
+    def add_pending_intervention(
+        self, request_id: str, request: ManualInterventionRequest, owner: ResourceOwner
+    ):
         """添加待处理的干预请求"""
         with self._lock:
-            self.pending_interventions.setdefault(request_id, []).append(request)
+            key = self._intervention_key(owner, request_id)
+            self.pending_interventions.setdefault(key, []).append(request)
 
-    def remove_pending_intervention(self, request_id: str, request: ManualInterventionRequest):
+    def remove_pending_intervention(
+        self, request_id: str, request: ManualInterventionRequest, owner: ResourceOwner
+    ):
         """移除待处理的干预请求"""
         with self._lock:
-            if request_id in self.pending_interventions:
-                self.pending_interventions[request_id] = [
-                    iv for iv in self.pending_interventions[request_id] if iv != request
+            key = self._intervention_key(owner, request_id)
+            if key in self.pending_interventions:
+                self.pending_interventions[key] = [
+                    iv for iv in self.pending_interventions[key] if iv != request
                 ]
 
     def _store_result(self, result: ManualInterventionResult) -> None:

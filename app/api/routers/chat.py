@@ -13,6 +13,7 @@ from app.config.settings import settings
 from app.infrastructure.agent.a2a_protocol import ManualInterventionRequest
 from app.infrastructure.memory.redis_postgres_conversation_memory import MemoryScope
 from app.infrastructure.security.auth import TokenPayload, require_auth
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.main import limiter
 from app.observability.alert_types import AlertSeverity, AlertTypes
 from app.schemas.chat import ChatRequest, ClearRequest
@@ -175,7 +176,8 @@ async def get_pending_intervention(
         "can_modify_params": true
     }
     """
-    pending_list = service._intervention_handler.get_pending_intervention(request_id)
+    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
+    pending_list = service._intervention_handler.get_pending_intervention(request_id, owner)
     return {
         "request_id": request_id,
         "pending_interventions": [p.dict() if hasattr(p, "dict") else p for p in pending_list],
@@ -238,7 +240,8 @@ async def get_intervention_history(
     _auth: Annotated[TokenPayload, Depends(require_auth)],
 ):
     """获取该请求的所有干预历史"""
-    history = service._intervention_handler.get_intervention_history(request_id)
+    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
+    history = service._intervention_handler.get_intervention_history(request_id, owner)
     return {
         "request_id": request_id,
         "interventions": [h.dict() if hasattr(h, "dict") else h for h in history],
