@@ -18,24 +18,37 @@ logger = logging.getLogger(__name__)
 
 
 class Role(str, Enum):
-    ADMIN = "admin"
+    ADMIN = "admin"  # 租户管理员
     OPERATOR = "operator"
     AUDITOR = "auditor"
+    PLATFORM_ADMIN = "platform_admin"  # 平台系统管理员
 
 
 class TokenPayload(BaseModel):
     sub: str
     role: Role
     exp: int
-    tenant_id: str  # 签发时写入，业务侧强制使用
+    tenant_id: str | None = None  # 签发时写入，业务侧强制使用
+
+
+class TenantTokenPayload(BaseModel):
+    sub: str
+    role: Role
+    exp: int
+    tenant_id: str
 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/token", auto_error=False)
 
 
 def create_access_token(
-    user_id: str, role: Role, tenant_id: str, expires_minutes: int | None = None
+    user_id: str, role: Role, tenant_id: str | None, expires_minutes: int | None = None
 ) -> str:
+    if role == Role.PLATFORM_ADMIN:
+        if tenant_id is not None:
+            raise ValueError("Platform admin should not have a tenant_id")
+    elif not tenant_id:
+        raise ValueError("Tenant ID is required for non-platform admins")
     exp_minutes = expires_minutes or 15
     expire_at = datetime.now(tz=UTC) + timedelta(minutes=exp_minutes)
     payload = {
@@ -118,6 +131,14 @@ def require_auth(token_data: Annotated[TokenPayload, Depends(get_current_user)])
     return token_data
 
 
+def require_tenant_auth(
+    token_data: Annotated[TokenPayload, Depends(get_current_user)],
+) -> TenantTokenPayload:
+    if not token_data.tenant_id or token_data.role == Role.PLATFORM_ADMIN:
+        raise AppError(ErrorCode.AUTH_FORBIDDEN)
+    return TenantTokenPayload.model_validate(token_data.model_dump())
+
+
 def require_roles(*roles: Role):
     def role_checker(
         token_data: Annotated[TokenPayload, Depends(get_current_user)],
@@ -150,3 +171,11 @@ def get_rate_limit_identity(token: str) -> str | None:
     if not isinstance(user_id, str) or not user_id:
         return None
     return f"tenant:{tenant_id}:user:{user_id}"
+
+
+def require_platform_admin(
+    token_data: Annotated[TokenPayload, Depends(get_current_user)],
+) -> TokenPayload:
+    if token_data.role != Role.PLATFORM_ADMIN or token_data.tenant_id is not None:
+        raise AppError(ErrorCode.AUTH_FORBIDDEN)
+    return token_data

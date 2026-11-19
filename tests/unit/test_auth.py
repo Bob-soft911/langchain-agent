@@ -13,6 +13,7 @@ from app.infrastructure.security.auth import (
     get_principal_tenant,
     get_rate_limit_identity,
     require_roles,
+    require_tenant_auth,
     verify_principal,
 )
 from app.schemas.errors import AppError, ErrorCode
@@ -153,3 +154,14 @@ def test_require_roles_blocks_unlisted_role() -> None:
 
     assert exc.value.code == ErrorCode.AUTH_FORBIDDEN
     assert checker(admin) is admin
+
+
+def test_require_tenant_auth_narrows_tenant_tokens_and_rejects_platform() -> None:
+    tenant_user = TokenPayload(sub="u", role=Role.ADMIN, exp=4102444800, tenant_id="t")
+    platform_user = TokenPayload(sub="p", role=Role.PLATFORM_ADMIN, exp=4102444800)
+
+    assert require_tenant_auth(tenant_user).tenant_id == "t"
+    with pytest.raises(AppError) as exc:
+        require_tenant_auth(platform_user)
+
+    assert exc.value.code == ErrorCode.AUTH_FORBIDDEN

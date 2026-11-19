@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
+from app.infrastructure.security.resource_scope import ResourceScopeClass
 from app.observability.alert_manager import AlertManager
 from app.observability.alert_types import Alert, AlertSeverity, AlertTypes
 
@@ -20,6 +21,7 @@ class TestAlertWebhookRetry(IsolatedAsyncioTestCase):
             title="Transient failure",
             message="Webhook delivery test",
             affected_resource="model-api",
+            owner=ResourceScopeClass(scope="platform"),
         )
 
     @staticmethod

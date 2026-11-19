@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
-from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from datetime import UTC, datetime
 from enum import Enum
+
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 
 
 class AlertTypes(str, Enum):

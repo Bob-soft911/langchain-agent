@@ -12,7 +12,7 @@ from app.application.services.chat_service import ChatService
 from app.config.settings import settings
 from app.infrastructure.agent.a2a_protocol import ManualInterventionRequest
 from app.infrastructure.memory.redis_postgres_conversation_memory import MemoryScope
-from app.infrastructure.security.auth import TokenPayload, require_auth
+from app.infrastructure.security.auth import TenantTokenPayload, require_tenant_auth
 from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.main import limiter
 from app.observability.alert_types import AlertSeverity, AlertTypes
@@ -70,7 +70,7 @@ async def chat_stream(
     request: Request,
     req: ChatRequest,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ) -> StreamingResponse:
     req.tenant_id = _auth.tenant_id
     req.user_id = _auth.sub
@@ -144,7 +144,7 @@ async def clear_memory(
     request: Request,
     req: ClearRequest,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ) -> dict[str, str]:
     req.tenant_id = _auth.tenant_id
     req.user_id = _auth.sub
@@ -163,7 +163,7 @@ async def get_pending_intervention(
     request: Request,
     request_id: str,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """
     获取正在等待用户干预的请求
@@ -192,7 +192,7 @@ async def submit_intervention(
     request_id: str,
     intervention: ManualInterventionRequest,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """
     提交人工干预请求
@@ -237,7 +237,7 @@ async def get_intervention_history(
     request: Request,
     request_id: str,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """获取该请求的所有干预历史"""
     owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
@@ -254,7 +254,7 @@ async def get_intervention_history(
 async def get_alerts(
     request: Request,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
     alert_type: str | None = None,
     severity: str | None = None,
     limit: int = 100,
@@ -262,8 +262,9 @@ async def get_alerts(
     # 调用 alert_manager 获取告警
     alert_type_enum = AlertTypes(alert_type) if alert_type else None
     severity_enum = AlertSeverity(severity) if severity else None
+    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
     alerts = service.alert_manager.get_alerts(
-        alert_type=alert_type_enum, severity=severity_enum, limit=limit
+        owner=owner, alert_type=alert_type_enum, severity=severity_enum, limit=limit
     )
     return {
         "total": len(alerts),
@@ -290,10 +291,11 @@ async def acknowledge_alert(
     alert_id: str,
     acknowledged_by: str,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """确认告警"""
-    success = service.alert_manager.acknowledge_alert(alert_id, acknowledged_by)
+    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
+    success = service.alert_manager.acknowledge_alert(alert_id, acknowledged_by, owner  )
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"告警 {alert_id} 未找到")
     return {"success": True}
@@ -305,7 +307,7 @@ async def get_metrics(
     request: Request,
     request_id: str,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """获取该请求的性能指标"""
     metrics = service.metrics_collector.get_metrics(request_id)

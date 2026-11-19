@@ -12,7 +12,7 @@ from app.infrastructure.security.auth import (
     TokenPayload,
     create_access_token,
     get_principal_tenant,
-    require_roles,
+    require_platform_admin,
     verify_principal,
 )
 from app.main import limiter
@@ -32,7 +32,9 @@ class TokenRequest(BaseModel):
 async def create_token(request: Request, token_request: TokenRequest):
     role = verify_principal(token_request.user_id, token_request.api_key)
     tenant_id = get_principal_tenant(token_request.user_id)
-    if not role or not tenant_id:
+    if not role or (role == Role.PLATFORM_ADMIN and tenant_id is not None) or (
+        role != Role.PLATFORM_ADMIN and not tenant_id
+    ):
         audit_logger.log(
             action=AuditAction.LOGIN,
             user_id=token_request.user_id,
@@ -51,7 +53,7 @@ async def create_token(request: Request, token_request: TokenRequest):
         action=AuditAction.LOGIN,
         user_id=token_request.user_id,
         result=AuditResult.SUCCESS,
-        tenant_id=tenant_id,
+        tenant_id=tenant_id or "platform",
         resource="/admin/token",
         detail={"role": role.value},
     )
@@ -65,7 +67,7 @@ async def update_config(
     key: str,
     value: Any,
     user_id: str = "system",
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.OPERATOR, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ):
     if key not in ALLOWED_CONFIG_KEYS:
         raise HTTPException(status_code=404, detail=f"Config key not found: {key}")
@@ -78,7 +80,7 @@ async def update_config(
             action=AuditAction.CONFIG_CHANGE,
             user_id=current_user.sub,
             result=AuditResult.SUCCESS,
-            tenant_id=current_user.tenant_id,
+            tenant_id=current_user.tenant_id or "platform",
             resource=f"/admin/config/{key}",
             detail={"new_value": value, "operator_user_id": user_id},
         )
@@ -94,7 +96,7 @@ async def update_config(
             action=AuditAction.CONFIG_CHANGE,
             user_id=current_user.sub,
             result=AuditResult.FAILURE,
-            tenant_id=current_user.tenant_id,
+            tenant_id=current_user.tenant_id or "platform",
             resource=f"/admin/config/{key}",
             detail={"error": str(exc), "operator_user_id": user_id},
         )
@@ -105,7 +107,7 @@ async def update_config(
 @limiter.limit("5/minute")  # 限制每分钟最多请求次数
 async def get_all_configs(
     request: Request,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ):
     return _dynamic_settings.get_all_overrides()
 
@@ -115,7 +117,7 @@ async def get_all_configs(
 async def get_config(
     request: Request,
     key: str,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.OPERATOR, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ):
     try:
         value = _dynamic_settings.get(key)
@@ -130,7 +132,7 @@ async def reset_config(
     request: Request,
     key: str,
     user_id: str = "system",
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.OPERATOR, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ):
     try:
         success = _dynamic_settings.reset(key, user_id=user_id)
@@ -140,7 +142,7 @@ async def reset_config(
             action=AuditAction.CONFIG_CHANGE,
             user_id=current_user.sub,
             result=AuditResult.SUCCESS,
-            tenant_id=current_user.tenant_id,
+            tenant_id=current_user.tenant_id or "platform",
             resource=f"/admin/config/{key}/reset",
             detail={"operator_user_id": user_id},
         )
@@ -156,7 +158,7 @@ async def reset_config(
             action=AuditAction.CONFIG_CHANGE,
             user_id=current_user.sub,
             result=AuditResult.FAILURE,
-            tenant_id=current_user.tenant_id,
+            tenant_id=current_user.tenant_id or "platform",
             resource=f"/admin/config/{key}/reset",
             detail={"error": str(exc), "operator_user_id": user_id},
         )
@@ -168,7 +170,7 @@ async def reset_config(
 async def get_config_change_history(
     request: Request,
     limit: int = 50,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.OPERATOR, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ):
     history = _dynamic_settings.get_change_history(limit=limit)
     return {"history": history}
@@ -178,20 +180,20 @@ async def get_config_change_history(
 @limiter.limit("30/minute")
 async def get_dlq_stats(
     request: Request,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ) -> dict[str, Any]:
     """查看 DLQ 各状态计数。"""
-    return await dead_letter_queue.stats()
+    return await dead_letter_queue.stats(owner=None)
 
 
 @router.get("/dlq/pending")
 @limiter.limit("30/minute")
 async def get_dlq_pending(
     request: Request,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN, Role.AUDITOR)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ) -> dict[str, Any]:
     """列出所有待处理/重试中的 DLQ 条目。"""
-    entries = await dead_letter_queue.list_pending()
+    entries = await dead_letter_queue.list_pending(owner=None)
     return {"count": len(entries), "items": [e.to_dict() for e in entries]}
 
 
@@ -200,8 +202,8 @@ async def get_dlq_pending(
 async def retry_dlq_entry(
     request: Request,
     dlq_id: str,
-    current_user: TokenPayload = Depends(require_roles(Role.ADMIN)),
+    current_user: TokenPayload = Depends(require_platform_admin),
 ) -> dict[str, Any]:
     """手动触发单条 DLQ 条目重试。"""
-    result = await dead_letter_queue.retry(dlq_id, lambda payload: payload)
+    result = await dead_letter_queue.retry(dlq_id,owner=None)
     return {"success": result, "dlq_id": dlq_id}

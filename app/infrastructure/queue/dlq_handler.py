@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import asdict, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, cast
+from typing import Any, Awaitable, cast
 
 from pydantic.dataclasses import dataclass
 from redis import asyncio as redis_asyncio
@@ -35,6 +35,10 @@ class DLQStatus(str, Enum):
     ABANDONED = "abandoned"
 
 
+ReplayHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+NON_REPLAYABLE_HANDLER = "manual"
+
+
 @dataclass
 class DLQEntry:
     """死信队列条目"""
@@ -44,6 +48,7 @@ class DLQEntry:
     payload: dict[str, Any]
     failure_reason: str
     owner: ResourceOwner
+    handler_key: str
     retry_count: int = 0
     max_retries: int = 3
     status: DLQStatus = DLQStatus.PENDING
@@ -62,7 +67,10 @@ class DLQEntry:
             task_id=data["task_id"],
             payload=data["payload"],
             failure_reason=data["failure_reason"],
-            owner=ResourceOwner(scope="tenant", tenant_id=data["owner"]["tenant_id"]),
+            owner=ResourceOwner(
+                scope=data["owner"]["scope"], tenant_id=data["owner"].get("tenant_id")
+            ),
+            handler_key=data["handler_key"],
             retry_count=data.get("retry_count", 0),
             max_retries=data.get("max_retries", 3),
             status=DLQStatus(data["status"]),
@@ -80,9 +88,20 @@ class DeadLetterQueue:
         self._lock = threading.Lock()
         self._entries: dict[str, DLQEntry] = {}
         self.redis = self._build_redis_client()
-        self._redis_index_key
         self._worker_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._replay_handler: dict[str, ReplayHandler] = {}
+
+    def register_replay_handler(self, handler_key: str, handler: ReplayHandler) -> None:
+        self._replay_handler[handler_key] = handler
+
+    async def _execute_entry(self, entry: DLQEntry) -> None:
+        handler = self._replay_handler.get(entry.handler_key)
+        if handler is None:
+            raise RuntimeError(f"No replay handler registered for DLQ type: {entry.handler_key}")
+        result = handler(entry.payload)
+        if asyncio.iscoroutine(result):
+            await result
 
     async def startup(self) -> None:
         """异步初始化：从Redis回捞历史DLQ数据，必须手动await调用"""
@@ -123,7 +142,7 @@ class DeadLetterQueue:
     def _redis_index_key(self, owner: ResourceOwner) -> str:
         scope, tenant_id = owner.storage_key()
         owner_id = tenant_id if tenant_id is not None else "platform"
-        return f"dlq:index:{owner_id}"
+        return f"dlq:index:{scope}:{owner_id}"
 
     async def _persist_entry(self, entry: DLQEntry) -> None:
         """将条目持久化到Redis"""
@@ -134,8 +153,10 @@ class DeadLetterQueue:
             await self.redis.set(
                 self._entry_keys(entry.dlq_id), json.dumps(entry.to_dict(), ensure_ascii=False)
             )
-            await self.redis.sadd(self._redis_index_key(entry.owner), entry.dlq_id)
-            await self.redis.expire(self._redis_index_key(entry.owner), ttl_seconds)
+            index_key = self._redis_index_key(entry.owner)
+            await self.redis.sadd(index_key, entry.dlq_id)
+            await self.redis.sadd("dlq:owners", index_key)
+            await self.redis.expire(index_key, ttl_seconds)
             await self.redis.expire(self._entry_keys(entry.dlq_id), ttl_seconds)
         except (ConnectionError, TimeoutError, ValueError, redis_asyncio.RedisError) as e:
             logger.error(f"Failed to persist DLQ entry: {e}")
@@ -146,19 +167,32 @@ class DeadLetterQueue:
             return
         try:
             if self.redis:
-                dlq_ids = await self.redis.smembers(
-                    self._redis_index_key(ResourceOwner(scope="tenant", tenant_id=""))
-                )
-                for dlq_id in dlq_ids:
-                    str_dlq_id = cast(str, dlq_id)
-                    entry_data = await self.redis.get(self._entry_keys(str_dlq_id))
-                    if entry_data:
-                        entry = DLQEntry.from_dict(json.loads(entry_data))
+                index_keys = await self.redis.smembers("dlq:owners")
+                for raw_index_key in index_keys:
+                    dlq_ids = await self.redis.smembers(raw_index_key)
+                    for dlq_id in dlq_ids:
+                        str_dlq_id = cast(str, dlq_id)
+                        entry_data = await self.redis.get(self._entry_keys(str_dlq_id))
+                        if not entry_data:
+                            continue
+                        try:
+                            entry = DLQEntry.from_dict(json.loads(entry_data))
+                        except (ValueError, KeyError) as e:
+                            logger.error(f"Failed to load DLQ entry {str_dlq_id}: {e}")
+                            continue
                         self._entries[str_dlq_id] = entry
         except (ConnectionError, TimeoutError, ValueError, redis_asyncio.RedisError) as e:
             logger.error(f"Failed to connect to Redis: {e}")
 
-    async def add(self, task_id: str, payload: dict[str, Any], failure_reason: str) -> DLQEntry:
+    async def add(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+        failure_reason: str,
+        *,
+        owner: ResourceOwner,
+        handler_key: str ,
+    ) -> DLQEntry:
         """添加死信队列条目"""
         with self._lock:
             dlq_id = f"dlq_{uuid.uuid4().hex[:12]}"
@@ -168,17 +202,25 @@ class DeadLetterQueue:
                 payload=payload,
                 failure_reason=failure_reason,
                 max_retries=self.max_retries,
-                owner=ResourceOwner(scope="tenant", tenant_id=payload.get("tenant_id", "")),
+                owner=owner,
+                handler_key=handler_key,
             )
             self._entries[dlq_id] = entry
         await self._persist_entry(entry)
         logger.warning(f"Added DLQ entry: {entry}")
         return entry
 
-    async def retry(self, dlq_id: str, execute: Callable[[dict[str, Any]], Any]) -> bool:
+    async def retry(
+        self,
+        dlq_id: str,
+        owner: ResourceOwner | None,
+    ) -> bool:
         """重试死信队列条目"""
         with self._lock:
             entry = self._entries.get(dlq_id)
+            if entry and owner is not None and entry.owner != owner:
+                logger.warning(f"DLQ entry owner mismatch: {dlq_id}")
+                return False
             if entry is None or entry.status in {DLQStatus.RESOLVED, DLQStatus.ABANDONED}:
                 logger.warning(f"DLQ entry not found or already resolved/abandoned: {dlq_id}")
                 return False
@@ -187,16 +229,16 @@ class DeadLetterQueue:
                 await self._persist_entry(entry)
                 logger.warning(f"DLQ entry abandoned after max retries: {entry}")
                 return False
+            if entry.handler_key == NON_REPLAYABLE_HANDLER:
+                logger.warning(f"DLQ entry is non-replayable: {entry}")
+                return False
             entry.retry_count += 1
             entry.last_retry_at = datetime.now(UTC).isoformat()
             entry.status = DLQStatus.RETRYING
             await self._persist_entry(entry)
         await asyncio.sleep(self.backoff_base_seconds * (2 ** max(entry.retry_count - 1, 0)))
         try:
-            result = execute(entry.payload)
-            if asyncio.iscoroutine(result):
-                await result
-            # await result  # This line is unnecessary and can be removed
+            await self._execute_entry(entry)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Retry failed for DLQ entry {dlq_id}: {e}")
             with self._lock:
@@ -211,15 +253,19 @@ class DeadLetterQueue:
         logger.info(f"DLQ entry resolved after retry: {entry}")
         return True
 
-    async def list_pending(self) -> list[DLQEntry]:
+    async def list_pending(self, *, owner: ResourceOwner | None) -> list[DLQEntry]:
         """列出所有待处理的死信队列条目"""
         with self._lock:
-            return [entry for entry in self._entries.values() if entry.status == DLQStatus.PENDING]
+            return [
+                entry
+                for entry in self._entries.values()
+                if entry.status == DLQStatus.PENDING and (owner is None or entry.owner == owner)
+            ]
 
-    async def stats(self) -> dict[str, Any]:
+    async def stats(self, owner: ResourceOwner | None) -> dict[str, Any]:
         """统计死信队列条目状态"""
         with self._lock:
-            entries = list(self._entries.values())
+            entries = [e for e in self._entries.values() if owner is None or e.owner == owner]
             return {
                 "total": len(entries),
                 "pending": sum(1 for e in entries if e.status == DLQStatus.PENDING),
@@ -234,15 +280,20 @@ class DeadLetterQueue:
             return
         while not self._stop_event.is_set():
             try:
-                pending_entries = await self.list_pending()
+                pending_entries = await self.list_pending(owner=None)
                 for entry in pending_entries:
+                    if entry.handler_key == NON_REPLAYABLE_HANDLER:
+                        continue
                     if entry.retry_count > entry.max_retries:
                         logger.info(f"Abandoning DLQ entry: {entry}")
                         entry.status = DLQStatus.ABANDONED
                         await self._persist_entry(entry)
                         continue
                     logger.info(f"Retrying DLQ entry: {entry}")
-                    await self.retry(entry.dlq_id, lambda payload: payload)
+                    await self.retry(
+                        entry.dlq_id,
+                        owner=None,
+                    )
             except (ConnectionError, TimeoutError, ValueError) as e:
                 logger.error(f"Error in DLQ worker loop: {e}")
             try:

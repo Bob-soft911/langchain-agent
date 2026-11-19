@@ -34,12 +34,16 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 "role": "auditor",
                 "tenant_id": "tenant-b",
             },
+            "platform-user": {
+                "api_key_hash": hashlib.sha256(b"platform-key").hexdigest(),
+                "role": "platform_admin",
+            },
         },
     )
     return TestClient(app, raise_server_exceptions=False)
 
 
-def _bearer(user: str, role: Role, tenant: str) -> dict[str, str]:
+def _bearer(user: str, role: Role, tenant: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token(user, role, tenant)}"}
 
 
@@ -86,10 +90,52 @@ def test_rbac_blocks_auditor_from_admin_only_endpoint(client: TestClient) -> Non
     assert resp.json()["error"]["code"] == "AUTH_FORBIDDEN"
 
 
-def test_admin_can_read_config(client: TestClient) -> None:
-    resp = client.get("/admin/config", headers=_bearer("admin-user", Role.ADMIN, "tenant-a"))
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/admin/config"),
+        ("get", "/admin/config/history"),
+        ("post", "/admin/config/task_max_retries?value=5"),
+        ("post", "/admin/config/task_max_retries/reset"),
+        ("get", "/admin/dlq/stats"),
+        ("get", "/admin/dlq/pending"),
+        ("post", "/admin/dlq/dlq_x/retry"),
+    ],
+)
+def test_tenant_admin_cannot_access_platform_endpoints(
+    client: TestClient, method: str, path: str
+) -> None:
+    resp = client.request(method, path, headers=_bearer("admin-user", Role.ADMIN, "tenant-a"))
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "AUTH_FORBIDDEN"
+
+
+def test_platform_admin_can_read_config(client: TestClient) -> None:
+    resp = client.get(
+        "/admin/config", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None)
+    )
 
     assert resp.status_code == 200
+
+
+def test_platform_admin_token_has_no_tenant(client: TestClient) -> None:
+    resp = client.post("/admin/token", json={"user_id": "platform-user", "api_key": "platform-key"})
+
+    assert resp.status_code == 200
+    claims = jwt.decode(
+        resp.json()["token"], settings.admin_jwt_secret, algorithms=[settings.admin_jwt_algorithm]
+    )
+    assert claims["role"] == "platform_admin"
+    assert claims["tenant_id"] is None
+
+
+def test_platform_admin_cannot_use_tenant_endpoints(client: TestClient) -> None:
+    resp = client.get(
+        "/chat/alerts", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None)
+    )
+
+    assert resp.status_code == 403
 
 
 def test_expired_token_is_rejected(client: TestClient) -> None:

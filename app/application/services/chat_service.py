@@ -63,7 +63,7 @@ from app.infrastructure.memory.redis_postgres_conversation_memory import (
     RedisPostgresConversationMemoryStore,
     TaskStatus,
 )
-from app.infrastructure.queue.dlq_handler import dead_letter_queue
+from app.infrastructure.queue.dlq_handler import NON_REPLAYABLE_HANDLER, dead_letter_queue
 from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.infrastructure.skill.registry import skill_registry
 from app.observability.alert_manager import AlertManager
@@ -447,6 +447,8 @@ class ChatService:
                         task_id=failed_task_id,
                         payload={"request_id": request_id},
                         failure_reason="parallel_task_execution_failed",
+                        owner=ResourceOwner(scope="tenant", tenant_id=req.tenant_id),
+                        handler_key=NON_REPLAYABLE_HANDLER,
                     )
                     if parallel_results.failed_tasks >= settings.agent_tool_failure_threshold:
                         self._intervention_handler.create_intervention_request(

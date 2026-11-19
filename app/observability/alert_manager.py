@@ -210,11 +210,11 @@ class AlertManager:
         {alert.context}
         """
 
-    def acknowledge_alert(self, alert_id: str, acknowledged_by: str) -> bool:
+    def acknowledge_alert(self, alert_id: str, acknowledged_by: str, owner: ResourceOwner) -> bool:
         """确认告警"""
         with self._lock:
             alert = self.alerts.get(alert_id)
-            if not alert:
+            if alert is None or alert.owner != owner:
                 logger.warning("Alert %s not found for acknowledgment", alert_id)
                 return False
             alert.acknowledged = True
@@ -225,13 +225,16 @@ class AlertManager:
 
     def get_alerts(
         self,
+        owner: ResourceOwner,
         alert_type: AlertTypes | None = None,
         severity: AlertSeverity | None = None,
         limit: int = 100,
     ) -> list[Alert]:
         """获取指定告警"""
         with self._lock:
-            alerts = deepcopy(list(self.alerts.values()))  # 读时取快照，返回副本
+            alerts = deepcopy([
+                alert for alert in self.alerts.values() if alert.owner == owner
+            ])  # 读时取快照，返回副本
         if alert_type:
             alerts = [alert for alert in alerts if alert.alert_type == alert_type]
         if severity:

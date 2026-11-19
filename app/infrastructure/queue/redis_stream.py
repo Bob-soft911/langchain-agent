@@ -8,7 +8,8 @@ from typing import Any, cast
 from redis import asyncio as redis_asyncio
 from redis.exceptions import RedisError
 
-from app.infrastructure.queue.dlq_handler import dead_letter_queue
+from app.infrastructure.queue.dlq_handler import NON_REPLAYABLE_HANDLER, dead_letter_queue
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +65,25 @@ class RedisStreamWorker:
                     await self._handle_message(message_id, fields)
 
     async def _handle_message(self, message_id: str, fields: dict[str, str]) -> None:
+        payload: Any = None
         try:
             payload = json.loads(fields["payload"])
             await self._handler(payload)
             await self._redis.xack(self._stream_key, self._group_name, message_id)
         except (RedisError, ValueError, Exception, KeyError) as e:
             logger.exception("Stream task failed: message_id=%s", message_id)
+            tenant_id = payload.get("tenant_id") if isinstance(payload, dict) else None
+            owner = (
+                ResourceOwner(scope="tenant", tenant_id=tenant_id)
+                if isinstance(tenant_id, str) and tenant_id
+                else ResourceOwner(scope="platform")
+            )
+            replayable = isinstance(payload, dict)
             await dead_letter_queue.add(
-                task_id=message_id, payload={"fields": fields}, failure_reason=str(e)
+                task_id=message_id,
+                payload=payload if replayable else {"fields": fields},
+                failure_reason=str(e),
+                owner=owner,
+                handler_key="ingest" if replayable else NON_REPLAYABLE_HANDLER,
             )
             await self._redis.xack(self._stream_key, self._group_name, message_id)

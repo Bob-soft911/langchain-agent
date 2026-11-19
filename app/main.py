@@ -45,6 +45,7 @@ from app.infrastructure.memory.redis_postgres_conversation_memory import (
 )
 from app.infrastructure.queue.redis_stream import RedisStreamWorker
 from app.infrastructure.security.auth import get_rate_limit_identity
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.infrastructure.vectorstore.chroma_store import ChromaStore
 from app.observability.alert_manager import alert_manager
 from app.observability.alert_types import AlertSeverity, AlertTypes
@@ -410,6 +411,7 @@ def create_app() -> FastAPI:
                             replayable=False,
                         )
                         alert_manager.create_alert(
+                            owner=ResourceOwner(scope="tenant", tenant_id=task.tenant_id),
                             alert_type=AlertTypes.FAULT_ALERT,
                             severity=AlertSeverity.CRITICAL,
                             title=f"中断任务已转换为等待人工干预 ({task.task_id})",
@@ -426,8 +428,6 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error("Startup checks failed: %s", e)
             raise
-
-        await dead_letter_queue.startup()  # 异步初始化 DLQ，从 Redis 回捞历史数据
 
         # 初始化 Redis Stream worker
         # 创建 IngestService 实例（用于处理异步入库任务）
@@ -447,6 +447,9 @@ def create_app() -> FastAPI:
             except Exception as e:
                 logger.error("❌ Ingest failed: %s", e)
                 raise
+
+        dead_letter_queue.register_replay_handler("ingest", handle_ingest_task)
+        await dead_letter_queue.startup()  # 异步初始化 DLQ，从 Redis 回捞历史数据
 
         redis_client = redis_asyncio.Redis(
             host=settings.redis_host,

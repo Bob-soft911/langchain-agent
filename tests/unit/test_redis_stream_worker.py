@@ -4,7 +4,9 @@ from typing import Any
 import pytest
 
 from app.infrastructure.queue import redis_stream
+from app.infrastructure.queue.dlq_handler import NON_REPLAYABLE_HANDLER
 from app.infrastructure.queue.redis_stream import RedisStreamWorker
+from app.infrastructure.security.resource_scope import ResourceScopeClass
 
 
 class FakeRedis:
@@ -20,8 +22,24 @@ class FakeDLQ:
     def __init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
 
-    async def add(self, task_id: str, payload: dict[str, Any], failure_reason: str) -> None:
-        self.entries.append({"task_id": task_id, "payload": payload, "reason": failure_reason})
+    async def add(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+        failure_reason: str,
+        *,
+        owner: Any,
+        handler_key: str,
+    ) -> None:
+        self.entries.append(
+            {
+                "task_id": task_id,
+                "payload": payload,
+                "reason": failure_reason,
+                "owner": owner,
+                "handler_key": handler_key,
+            }
+        )
 
 
 @pytest.fixture
@@ -56,10 +74,14 @@ async def test_handler_failure_goes_to_dlq_and_is_acked(dlq: FakeDLQ) -> None:
     async def handler(_payload: dict[str, Any]) -> None:
         raise RuntimeError("downstream down")
 
-    await _worker(redis, handler)._handle_message("2-0", {"payload": "{}"})
+    await _worker(redis, handler)._handle_message(
+        "2-0", {"payload": json.dumps({"tenant_id": "tenant-a"})}
+    )
 
     assert [entry["task_id"] for entry in dlq.entries] == ["2-0"]
     assert "downstream down" in dlq.entries[0]["reason"]
+    assert dlq.entries[0]["handler_key"] == "ingest"
+    assert dlq.entries[0]["owner"] == ResourceScopeClass(scope="tenant", tenant_id="tenant-a")
     assert len(redis.acked) == 1  # 失败后 ACK，避免毒消息被反复投递
 
 
@@ -74,4 +96,7 @@ async def test_malformed_message_goes_to_dlq(dlq: FakeDLQ, fields: dict[str, str
     await _worker(redis, handler)._handle_message("3-0", fields)
 
     assert len(dlq.entries) == 1
+    assert dlq.entries[0]["handler_key"] == NON_REPLAYABLE_HANDLER
+    assert dlq.entries[0]["payload"] == {"fields": fields}
+    assert dlq.entries[0]["owner"] == ResourceScopeClass(scope="platform")
     assert len(redis.acked) == 1
