@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field, replace
 from threading import RLock
 
+from app.infrastructure.security.auth import TenantTokenPayload
+from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.observability.prometheus_metrics import CACHE_OPERATIONS, LLM_TOKEN_USAGE
 
 
@@ -70,15 +72,18 @@ class MetricsCollector:
         self.max_requests = max_requests
         self.max_latency_samples_per_request = max_latency_samples_per_request
         self._lock = RLock()  # 用于线程安全的访问
+        self._owners: dict[str, ResourceOwner] = {}
 
-    def create_metrics(self, request_id: str) -> PerformanceMetrics:
+    def create_metrics(self, request_id: str, owner: ResourceOwner) -> PerformanceMetrics:
         with self._lock:
             if len(self.metrics_store) >= self.max_requests:
                 # 超过最大请求数，清理最旧的请求指标
                 oldest_request_id = next(iter(self.metrics_store))
                 del self.metrics_store[oldest_request_id]
+                self._owners.pop(oldest_request_id, None)
             metrics = PerformanceMetrics(request_id=request_id, total_time_ms=0.0)
             self.metrics_store[request_id] = metrics
+            self._owners[request_id] = owner
             return metrics
 
     def record_latency(self, request_id: str, latency_ms: float):
@@ -133,6 +138,20 @@ class MetricsCollector:
             if metrics is None:
                 return None
             return replace(metrics, latencies_ms=list(metrics.latencies_ms))
+
+    def get_metrics_for(
+        self, request_id: str, principal: TenantTokenPayload
+    ) -> PerformanceMetrics | None:
+        """获取指标"""
+        with self._lock:
+            owner = self._owners.get(request_id)
+            if owner is None or not owner.can_access(
+                tenant_id=principal.tenant_id,
+                user_id=principal.sub,
+                role=principal.role,
+            ):
+                return None
+            return self.get_metrics(request_id)
 
     def get_summary(self, request_id: str) -> dict | None:
         """获取指标汇总"""

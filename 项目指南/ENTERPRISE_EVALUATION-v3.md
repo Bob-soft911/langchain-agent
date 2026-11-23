@@ -44,7 +44,8 @@
 ### M0：隔离与任务可靠性（上线阻断）
 
 - [ 已修复] 为告警、人工干预、DLQ、动态配置定义明确的租户/平台管理边界。
-- [ ] 所有 ID 查询和变更都校验 JWT 租户、资源所有者及角色；平台级接口需独立系统管理员权限。
+- [ 已修复] 所有 ID 查询和变更都校验 JWT 租户、资源所有者及角色；平台级接口需独立系统管理员权限。
+    - 修复说明：`ResourceScopeClass` 新增 `owner_user_id` 与统一的 `can_access` 判定；干预查询、请求指标按租户+所有者校验（租户管理员可见本租户全部，越权与不存在统一返回 404）；提交干预、确认告警、文档摄入限定 `ADMIN`/`OPERATOR`，告警确认人取自 JWT；摄入接口拒绝平台管理员；JWT 解析强制角色与租户声明一致。负向用例见 `tests/integration/test_admin_auth_api.py`、`tests/unit/test_resource_isolation.py`、`tests/unit/test_intervention_handler.py`、`tests/unit/test_auth.py`。
 - [ ] DLQ 重试调用真实业务处理器，不允许空操作返回成功；加入幂等键和重复执行防护。
 - [ ] 修复 DLQ 持久化失败仍 ACK 的数据丢失路径。
 - [ ] 移除异步 I/O 期间持有的同步锁，并增加并发重试测试。

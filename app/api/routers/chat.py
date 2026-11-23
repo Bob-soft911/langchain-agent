@@ -12,7 +12,12 @@ from app.application.services.chat_service import ChatService
 from app.config.settings import settings
 from app.infrastructure.agent.a2a_protocol import ManualInterventionRequest
 from app.infrastructure.memory.redis_postgres_conversation_memory import MemoryScope
-from app.infrastructure.security.auth import TenantTokenPayload, require_tenant_auth
+from app.infrastructure.security.auth import (
+    TENANT_WRITE_ROLES,
+    TenantTokenPayload,
+    require_tenant_auth,
+    require_tenant_roles,
+)
 from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 from app.main import limiter
 from app.observability.alert_types import AlertSeverity, AlertTypes
@@ -176,8 +181,9 @@ async def get_pending_intervention(
         "can_modify_params": true
     }
     """
-    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
-    pending_list = service._intervention_handler.get_pending_intervention(request_id, owner)
+    pending_list = service._intervention_handler.get_pending_intervention(request_id, _auth)
+    if pending_list is None:
+        raise AppError(ErrorCode.RESOURCE_NOT_FOUND)
     return {
         "request_id": request_id,
         "pending_interventions": [p.dict() if hasattr(p, "dict") else p for p in pending_list],
@@ -192,7 +198,7 @@ async def submit_intervention(
     request_id: str,
     intervention: ManualInterventionRequest,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_roles(*TENANT_WRITE_ROLES))],
 ):
     """
     提交人工干预请求
@@ -240,8 +246,9 @@ async def get_intervention_history(
     _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """获取该请求的所有干预历史"""
-    owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
-    history = service._intervention_handler.get_intervention_history(request_id, owner)
+    history = service._intervention_handler.get_intervention_history(request_id, _auth)
+    if history is None:
+        raise AppError(ErrorCode.RESOURCE_NOT_FOUND)
     return {
         "request_id": request_id,
         "interventions": [h.dict() if hasattr(h, "dict") else h for h in history],
@@ -289,13 +296,12 @@ async def get_alerts(
 async def acknowledge_alert(
     request: Request,
     alert_id: str,
-    acknowledged_by: str,
     service: Annotated[ChatService, Depends(_get_chat_service)],
-    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_roles(*TENANT_WRITE_ROLES))],
 ):
     """确认告警"""
     owner = ResourceOwner(scope="tenant", tenant_id=_auth.tenant_id)
-    success = service.alert_manager.acknowledge_alert(alert_id, acknowledged_by, owner  )
+    success = service.alert_manager.acknowledge_alert(alert_id, _auth.sub, owner)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"告警 {alert_id} 未找到")
     return {"success": True}
@@ -310,7 +316,7 @@ async def get_metrics(
     _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ):
     """获取该请求的性能指标"""
-    metrics = service.metrics_collector.get_metrics(request_id)
+    metrics = service.metrics_collector.get_metrics_for(request_id, _auth)
     if not metrics:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"请求 {request_id} 的性能指标未找到"

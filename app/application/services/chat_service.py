@@ -163,7 +163,14 @@ class ChatService:
             },
             parent_run=parent_run,
         )
-        self.metrics_collector.create_metrics(request_id=request_id)
+        self.metrics_collector.create_metrics(
+            request_id=request_id,
+            owner=ResourceOwner(
+                scope="tenant",
+                tenant_id=req.tenant_id,
+                owner_user_id=req.user_id,
+            ),
+        )
         logger.info(
             "[%s] Chat aask_stream start: tenant=%s user=%s thread=%s query=%s",
             request_id,
@@ -456,7 +463,7 @@ class ChatService:
                             reason="parallel_task_execution_failed。",
                             user_id=req.user_id,
                             request_id=request_id,
-                            owner=ResourceOwner(scope="tenant", tenant_id=req.tenant_id),
+                            owner=ResourceOwner(scope="tenant", tenant_id=req.tenant_id,owner_user_id=req.user_id),
                         )
             else:
                 if tool_selection and tool_selection.tool_name:
@@ -1471,9 +1478,9 @@ class ChatService:
                 self._intervention_handler.create_intervention_request(
                     task_id=subtask.task_id,
                     reason=root_cause,
-                    user_id=state.active_agent_id if state else "system",
+                    user_id=history_scope.user_id,
                     request_id=request_id,
-                    owner=ResourceOwner(scope="tenant", tenant_id=history_scope.tenant_id),
+                    owner=ResourceOwner(scope="tenant", tenant_id=history_scope.tenant_id, owner_user_id=history_scope.user_id),
                 )
                 self.alert_manager.create_alert(
                     owner=ResourceOwner(scope="tenant", tenant_id=history_scope.tenant_id),

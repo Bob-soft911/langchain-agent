@@ -20,7 +20,12 @@ from app.config.settings import settings
 from app.config.tracing_config import get_langsmith_client, is_langsmith_enabled
 from app.infrastructure.cache.idempotency_guard import IdempotencyGuard
 from app.infrastructure.embedding.embedding_client import EmbeddingClient
-from app.infrastructure.security.auth import TokenPayload, require_auth
+from app.infrastructure.security.auth import (
+    TENANT_WRITE_ROLES,
+    TenantTokenPayload,
+    require_tenant_auth,
+    require_tenant_roles,
+)
 from app.infrastructure.vectorstore.chroma_store import ChromaStore
 from app.main import limiter
 from app.observability.langsmith_tracer import LangSmithTracer
@@ -97,7 +102,7 @@ def _idempotency_key(req: IngestTextRequest, idempotency_key: str | None) -> str
 async def ingest_text(
     request: Request,
     req: IngestTextRequest,
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_roles(*TENANT_WRITE_ROLES))],
     idempotency_key: str | None = Header(None),
 ) -> IngestResponse:
     """接收纯文本并摄入向量库。
@@ -109,7 +114,7 @@ async def ingest_text(
         "metadata": {"category": "告警规则"}
     }
     """
-    req.tenant_id = _auth.tenant_id
+    req.tenant_id = _auth.tenant_id  
     if len(req.content.encode("utf-8")) > MAX_INGEST_TEXT_SIZE:
         raise AppError(
             ErrorCode.PAYLOAD_TOO_LARGE, f"内容超过 {MAX_INGEST_TEXT_SIZE / 1024 / 1024:.0f}MB 限制"
@@ -142,7 +147,7 @@ async def ingest_text(
 @limiter.limit("10/minute")
 def ingest_stats(
     request: Request,
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
 ) -> dict[str, int]:
     """查看当前向量库中的文档总数。"""
     root_run = _trace.start_root(
@@ -165,7 +170,7 @@ def ingest_stats(
 async def ingest_file(
     request: Request,
     file: UploadFile,
-    _auth: Annotated[TokenPayload, Depends(require_auth)],
+    _auth: Annotated[TenantTokenPayload, Depends(require_tenant_roles(*TENANT_WRITE_ROLES))],
     source_id: str = Form(...),
     category: str = Form("文件导入"),
     idempotency_key: str | None = Header(None),
@@ -202,7 +207,7 @@ async def ingest_file(
                 "filename": file_name,
                 "suffix": Path(file_name).suffix,
             },
-            tenant_id=_auth.tenant_id,
+            tenant_id=_auth.tenant_id, 
         )
 
         idempotency_key_value = _idempotency_key(ingest_req, idempotency_key)

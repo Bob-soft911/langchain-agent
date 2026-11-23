@@ -4,7 +4,7 @@ import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 
 import jwt
 from fastapi import Depends
@@ -103,10 +103,16 @@ def get_current_user(token: str | None = Depends(oauth2_scheme)) -> TokenPayload
         sub = payload.get("sub")
         role = payload.get("role")
         exp = payload.get("exp")
-        tenant_id = cast(str, payload.get("tenant_id"))
+        tenant_id = payload.get("tenant_id")
         if not sub or not role or not exp:
             raise credentials_exception
-        token_data = TokenPayload(sub=sub, role=Role(role), exp=exp, tenant_id=tenant_id)
+        role_enum = Role(role)
+        # 角色与租户声明必须一致：平台管理员无租户，其余角色必须有租户
+        if role_enum == Role.PLATFORM_ADMIN and tenant_id is not None:
+            raise credentials_exception
+        if role_enum != Role.PLATFORM_ADMIN and not tenant_id:
+            raise credentials_exception
+        token_data = TokenPayload(sub=sub, role=role_enum, exp=exp, tenant_id=tenant_id)
         return token_data
     except (jwt.PyJWTError, ValueError) as exc:
         logger.warning("Authentication failed: invalid token (%s)", type(exc).__name__)
@@ -137,6 +143,22 @@ def require_tenant_auth(
     if not token_data.tenant_id or token_data.role == Role.PLATFORM_ADMIN:
         raise AppError(ErrorCode.AUTH_FORBIDDEN)
     return TenantTokenPayload.model_validate(token_data.model_dump())
+
+
+def require_tenant_roles(*roles: Role):
+    """租户内角色校验：先保证是租户主体，再校验角色。"""
+
+    def checker(
+        token_data: Annotated[TenantTokenPayload, Depends(require_tenant_auth)],
+    ) -> TenantTokenPayload:
+        if token_data.role not in roles:
+            raise AppError(ErrorCode.AUTH_FORBIDDEN)
+        return token_data
+
+    return checker
+
+
+TENANT_WRITE_ROLES = (Role.ADMIN, Role.OPERATOR)
 
 
 def require_roles(*roles: Role):

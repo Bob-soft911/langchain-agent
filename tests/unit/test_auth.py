@@ -6,7 +6,9 @@ import pytest
 
 from app.config.settings import settings
 from app.infrastructure.security.auth import (
+    TENANT_WRITE_ROLES,
     Role,
+    TenantTokenPayload,
     TokenPayload,
     create_access_token,
     get_current_user,
@@ -14,6 +16,7 @@ from app.infrastructure.security.auth import (
     get_rate_limit_identity,
     require_roles,
     require_tenant_auth,
+    require_tenant_roles,
     verify_principal,
 )
 from app.schemas.errors import AppError, ErrorCode
@@ -165,3 +168,35 @@ def test_require_tenant_auth_narrows_tenant_tokens_and_rejects_platform() -> Non
         require_tenant_auth(platform_user)
 
     assert exc.value.code == ErrorCode.AUTH_FORBIDDEN
+
+
+@pytest.mark.usefixtures("fixed_jwt_secret")
+@pytest.mark.parametrize(
+    ("role", "tenant_id"),
+    [("platform_admin", "t-a"), ("admin", None), ("operator", "")],
+)
+def test_token_with_inconsistent_role_and_tenant_is_rejected(
+    fixed_jwt_secret: str, role: str, tenant_id: str | None
+) -> None:
+    token = jwt.encode(
+        {"sub": "eve", "role": role, "tenant_id": tenant_id, "exp": 4102444800},
+        fixed_jwt_secret,
+        algorithm=settings.admin_jwt_algorithm,
+    )
+
+    with pytest.raises(AppError) as exc:
+        get_current_user(token)
+
+    assert exc.value.code == ErrorCode.AUTH_INVALID_TOKEN
+
+
+def test_require_tenant_roles_blocks_auditor_writes() -> None:
+    checker = require_tenant_roles(*TENANT_WRITE_ROLES)
+    auditor = TenantTokenPayload(sub="a", role=Role.AUDITOR, exp=4102444800, tenant_id="t")
+    operator = auditor.model_copy(update={"role": Role.OPERATOR})
+
+    with pytest.raises(AppError) as exc:
+        checker(auditor)
+
+    assert exc.value.code == ErrorCode.AUTH_FORBIDDEN
+    assert checker(operator) is operator

@@ -1,13 +1,20 @@
 import hashlib
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config.settings import settings
+from app.infrastructure.agent.intervention_handler import InterventionHandler
 from app.infrastructure.security.auth import Role, create_access_token
-from app.main import app, limiter
+from app.infrastructure.security.resource_scope import ResourceScopeClass
+from app.main import app, limiter  # 必须先于路由模块导入，路由模块会反向 import app.main
+from app.api.routers.chat import _get_chat_service  # noqa: I001
+from app.observability.alert_manager import AlertManager
+from app.observability.alert_types import AlertSeverity, AlertTypes
+from app.observability.metrics import MetricsCollector
 
 
 @pytest.fixture(autouse=True)
@@ -112,9 +119,7 @@ def test_tenant_admin_cannot_access_platform_endpoints(
 
 
 def test_platform_admin_can_read_config(client: TestClient) -> None:
-    resp = client.get(
-        "/admin/config", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None)
-    )
+    resp = client.get("/admin/config", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None))
 
     assert resp.status_code == 200
 
@@ -131,9 +136,7 @@ def test_platform_admin_token_has_no_tenant(client: TestClient) -> None:
 
 
 def test_platform_admin_cannot_use_tenant_endpoints(client: TestClient) -> None:
-    resp = client.get(
-        "/chat/alerts", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None)
-    )
+    resp = client.get("/chat/alerts", headers=_bearer("platform-user", Role.PLATFORM_ADMIN, None))
 
     assert resp.status_code == 403
 
@@ -144,3 +147,111 @@ def test_expired_token_is_rejected(client: TestClient) -> None:
     resp = client.get("/admin/config", headers={"Authorization": f"Bearer {token}"})
 
     assert resp.status_code == 401
+
+
+# ---- 租户/所有者/角色负向用例：request-1 属于 tenant-a 的 owner-user ----
+
+OWNER = ("owner-user", Role.OPERATOR, "tenant-a")
+PEER = ("peer-user", Role.OPERATOR, "tenant-a")
+AUDITOR = ("auditor-user", Role.AUDITOR, "tenant-a")
+OTHER_TENANT_ADMIN = ("other-admin", Role.ADMIN, "tenant-b")
+PLATFORM_ADMIN = ("platform-user", Role.PLATFORM_ADMIN, None)
+
+READ_PATHS = [
+    "/chat/request-1/pending-intervention",
+    "/chat/request-1/intervention-history",
+    "/chat/metrics/request-1",
+]
+
+
+@pytest.fixture
+def chat_service() -> Iterator[SimpleNamespace]:
+    owner = ResourceScopeClass(scope="tenant", tenant_id="tenant-a", owner_user_id="owner-user")
+    interventions = InterventionHandler()
+    interventions.create_intervention_request(
+        task_id="task-1", reason="r", user_id="owner-user", request_id="request-1", owner=owner
+    )
+    metrics = MetricsCollector()
+    metrics.create_metrics("request-1", owner)
+    alerts = AlertManager()
+    alert = alerts.create_alert(
+        owner=ResourceScopeClass(scope="tenant", tenant_id="tenant-a"),
+        alert_type=AlertTypes.FAULT_ALERT,
+        severity=AlertSeverity.INFO,
+        title="t",
+        message="m",
+        affected_resource="task-1",
+    )
+    service = SimpleNamespace(
+        _intervention_handler=interventions,
+        metrics_collector=metrics,
+        alert_manager=alerts,
+        alert_id=alert.alert_id,
+    )
+    app.dependency_overrides[_get_chat_service] = lambda: service
+    yield service
+    app.dependency_overrides.pop(_get_chat_service, None)
+    alerts.close()
+
+
+@pytest.mark.usefixtures("chat_service")
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_resource_owner_can_read(client: TestClient, path: str) -> None:
+    assert client.get(path, headers=_bearer(*OWNER)).status_code == 200
+
+
+@pytest.mark.usefixtures("chat_service")
+@pytest.mark.parametrize("principal", [PEER, OTHER_TENANT_ADMIN])
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_cross_tenant_or_non_owner_read_returns_404(
+    client: TestClient, path: str, principal: tuple
+) -> None:
+    assert client.get(path, headers=_bearer(*principal)).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("principal", "method", "path", "body"),
+    [
+        (
+            AUDITOR,
+            "post",
+            "/chat/request-1/intervention",
+            {"task_id": "task-1", "intervention_type": "skip"},
+        ),
+        (AUDITOR, "post", "/chat/alerts/{alert_id}/acknowledge", None),
+        (AUDITOR, "post", "/ingest/text", {"content": "x", "source_id": "s"}),
+        (PLATFORM_ADMIN, "post", "/ingest/text", {"content": "x", "source_id": "s"}),
+        (PLATFORM_ADMIN, "get", "/ingest/stats", None),
+    ],
+)
+def test_write_and_tenant_endpoints_reject_wrong_role(
+    client: TestClient,
+    chat_service: SimpleNamespace,
+    principal: tuple,
+    method: str,
+    path: str,
+    body: dict | None,
+) -> None:
+    resp = client.request(
+        method,
+        path.format(alert_id=chat_service.alert_id),
+        json=body,
+        headers=_bearer(*principal),
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "AUTH_FORBIDDEN"
+
+
+def test_alert_acknowledge_is_tenant_scoped_and_uses_jwt_subject(
+    client: TestClient, chat_service: SimpleNamespace
+) -> None:
+    path = f"/chat/alerts/{chat_service.alert_id}/acknowledge?acknowledged_by=spoofed"
+
+    assert client.post(path, headers=_bearer(*OTHER_TENANT_ADMIN)).status_code == 404
+    assert client.post(path, headers=_bearer(*OWNER)).status_code == 200
+
+    alert = chat_service.alert_manager.get_alerts(
+        owner=ResourceScopeClass(scope="tenant", tenant_id="tenant-a")
+    )[0]
+    assert alert.acknowledged_by == "owner-user"  # 忽略客户端传入的确认人

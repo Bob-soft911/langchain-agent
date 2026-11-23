@@ -12,6 +12,7 @@ from app.infrastructure.agent.a2a_protocol import (
     ManualInterventionRequest,
     ManualInterventionResult,
 )
+from app.infrastructure.security.auth import TenantTokenPayload
 from app.infrastructure.security.resource_scope import ResourceScopeClass as ResourceOwner
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class InterventionHandler:
         self.pending_interventions: dict[InterventionKey, list[ManualInterventionRequest]] = {}
         self.intervention_results: dict[str, ManualInterventionResult] = {}
         self._lock = RLock()
+        self._owners: dict[InterventionKey, ResourceOwner] = {}
 
     def create_intervention_request(
         self,
@@ -45,9 +47,23 @@ class InterventionHandler:
         )
         with self._lock:
             key = self._intervention_key(owner, request_id)
+            self._owners.setdefault(key, owner)
             self.pending_interventions.setdefault(key, []).append(request)
         logger.info(f"Created intervention request for task {task_id} with reason: {reason}")
         return request
+
+    def _authorized_key(
+        self, request_id: str, principal: TenantTokenPayload
+    ) -> InterventionKey | None:
+        key: InterventionKey = ("tenant", principal.tenant_id, request_id)
+        owner = self._owners.get(key)
+        if owner is None or not owner.can_access(
+            tenant_id=principal.tenant_id,
+            user_id=principal.sub,
+            role=principal.role,
+        ):
+            return None
+        return key
 
     def submit_intervention(
         self,
@@ -167,20 +183,26 @@ class InterventionHandler:
                     ),
                 )
 
-    def get_pending_intervention(self, request_id: str, owner: ResourceOwner) -> list:
+    def get_pending_intervention(
+        self, request_id: str, principal: TenantTokenPayload
+    ) -> list | None:
         """获取待处理的干预请求"""
         with self._lock:
-            key = self._intervention_key(owner, request_id)
+            key = self._authorized_key(request_id, principal)
+            if key is None:
+                return None
             return deepcopy(self.pending_interventions.get(key, []))
 
     def _intervention_key(self, owner: ResourceOwner, request_id: str) -> InterventionKey:
         scope, tenant_id = owner.storage_key()
         return scope, tenant_id, request_id
 
-    def get_intervention_history(self, request_id: str, owner: ResourceOwner) -> list:
+    def get_intervention_history(self, request_id: str, principal: TenantTokenPayload) -> list | None:
         """获取干预历史"""
         with self._lock:
-            key = self._intervention_key(owner, request_id)
+            key = self._authorized_key(request_id, principal)
+            if key is None:
+                return None
             return deepcopy(self.intervention_history.get(key, []))
 
     def add_pending_intervention(
@@ -189,6 +211,7 @@ class InterventionHandler:
         """添加待处理的干预请求"""
         with self._lock:
             key = self._intervention_key(owner, request_id)
+            self._owners.setdefault(key, owner)
             self.pending_interventions.setdefault(key, []).append(request)
 
     def remove_pending_intervention(
