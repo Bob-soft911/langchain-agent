@@ -1,5 +1,7 @@
 """文档摄入服务 - 编排 切块 → 向量化 → 存储 的完整流程。"""
 
+import hashlib
+import json
 import logging
 
 from langsmith.run_trees import RunTree
@@ -70,7 +72,25 @@ class IngestService:
             ]
 
             # 写入向量库
-            self._store.add_documents(texts=chunks, metadatas=metadatas, parent_run=ingest_run)
+            content_digest = hashlib.sha256(req.content.encode("utf-8")).hexdigest()
+            ids = [
+                hashlib.sha256(
+                    (
+                        json.dumps(
+                            [req.tenant_id, req.source_id, content_digest, i],
+                            separators=(",", ":"),
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                for i in range(len(chunks))
+            ]
+            self._store.add_documents(
+                texts=chunks,
+                metadatas=metadatas,
+                ids=ids,
+                parent_run=ingest_run,
+                upsert=True,
+            )
 
             resp = IngestResponse(
                 source_id=req.source_id,

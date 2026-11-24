@@ -7,12 +7,13 @@
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, field
+from dataclasses import asdict, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Awaitable, cast
@@ -100,7 +101,7 @@ class DeadLetterQueue:
         if handler is None:
             raise RuntimeError(f"No replay handler registered for DLQ type: {entry.handler_key}")
         result = handler(entry.payload)
-        if asyncio.iscoroutine(result):
+        if inspect.isawaitable(result):
             await result
 
     async def startup(self) -> None:
@@ -191,7 +192,7 @@ class DeadLetterQueue:
         failure_reason: str,
         *,
         owner: ResourceOwner,
-        handler_key: str ,
+        handler_key: str,
     ) -> DLQEntry:
         """添加死信队列条目"""
         with self._lock:
@@ -218,40 +219,38 @@ class DeadLetterQueue:
         """重试死信队列条目"""
         with self._lock:
             entry = self._entries.get(dlq_id)
-            if entry and owner is not None and entry.owner != owner:
-                logger.warning(f"DLQ entry owner mismatch: {dlq_id}")
+            if entry is None or entry.status != DLQStatus.PENDING:
                 return False
-            if entry is None or entry.status in {DLQStatus.RESOLVED, DLQStatus.ABANDONED}:
-                logger.warning(f"DLQ entry not found or already resolved/abandoned: {dlq_id}")
-                return False
-            if entry.retry_count >= entry.max_retries:
-                entry.status = DLQStatus.ABANDONED
-                await self._persist_entry(entry)
-                logger.warning(f"DLQ entry abandoned after max retries: {entry}")
+            if owner is not None and entry.owner != owner:
+                logger.warning("DLQ 条目归属不匹配：dlq_id=%s", dlq_id)
                 return False
             if entry.handler_key == NON_REPLAYABLE_HANDLER:
-                logger.warning(f"DLQ entry is non-replayable: {entry}")
+                logger.warning("DLQ 条目不支持自动重放：dlq_id=%s", dlq_id)
                 return False
-            entry.retry_count += 1
-            entry.last_retry_at = datetime.now(UTC).isoformat()
+            exhausted = entry.retry_count >= entry.max_retries
             entry.status = DLQStatus.RETRYING
-            await self._persist_entry(entry)
-        await asyncio.sleep(self.backoff_base_seconds * (2 ** max(entry.retry_count - 1, 0)))
+            if not exhausted:
+                entry.retry_count += 1
+                entry.last_retry_at = datetime.now(UTC).isoformat()
+            final_status = DLQStatus.ABANDONED if exhausted else DLQStatus.PENDING
+
         try:
-            await self._execute_entry(entry)
+            if exhausted:
+                logger.warning("DLQ 条目已达到最大重试次数：dlq_id=%s", dlq_id)
+            else:
+                delay = self.backoff_base_seconds * 2 ** (entry.retry_count - 1)
+                await asyncio.sleep(delay)
+                await self._execute_entry(entry)
+                final_status = DLQStatus.RESOLVED
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Retry failed for DLQ entry {dlq_id}: {e}")
-            with self._lock:
-                entry = self._entries.get(dlq_id)
-                if entry:
-                    entry.status = DLQStatus.PENDING
-                    await self._persist_entry(entry)
-            return False
-        with self._lock:
-            entry.status = DLQStatus.RESOLVED
-            await self._persist_entry(entry)
-        logger.info(f"DLQ entry resolved after retry: {entry}")
-        return True
+            logger.exception(f"Retry failed for DLQ entry {dlq_id}: {e}")
+        finally:
+            try:
+                await self._persist_entry(replace(entry, status=final_status))
+            finally:
+                with self._lock:
+                    entry.status = final_status
+        return final_status == DLQStatus.RESOLVED
 
     async def list_pending(self, *, owner: ResourceOwner | None) -> list[DLQEntry]:
         """列出所有待处理的死信队列条目"""
@@ -280,14 +279,8 @@ class DeadLetterQueue:
             return
         while not self._stop_event.is_set():
             try:
-                pending_entries = await self.list_pending(owner=None)
-                for entry in pending_entries:
+                for entry in await self.list_pending(owner=None):
                     if entry.handler_key == NON_REPLAYABLE_HANDLER:
-                        continue
-                    if entry.retry_count > entry.max_retries:
-                        logger.info(f"Abandoning DLQ entry: {entry}")
-                        entry.status = DLQStatus.ABANDONED
-                        await self._persist_entry(entry)
                         continue
                     logger.info(f"Retrying DLQ entry: {entry}")
                     await self.retry(

@@ -45,6 +45,7 @@ class ChromaStore:
         ids: list[str] | None = None,
         *,
         parent_run: RunTree | None = None,
+        upsert: bool = False,
     ) -> list[str]:
         # 创建 vectorstore.add_documents 子 run
         run = self._tracer.start_child(
@@ -65,7 +66,7 @@ class ChromaStore:
             if ids is None:
                 ids = [str(uuid.uuid4()) for _ in texts]
 
-            self._collection.add(
+            (self._collection.upsert if upsert else self._collection.add)(
                 ids=ids,
                 embeddings=embeddings,  # type: ignore[arg-type]
                 documents=texts,

@@ -436,13 +436,19 @@ def create_app() -> FastAPI:
         async def handle_ingest_task(payload: dict[str, Any]) -> None:
             """处理文档入库任务"""
             try:
+                tenant_id = payload.get("tenant_id")
+                if not isinstance(tenant_id, str) or not tenant_id.strip():
+                    raise ValueError("DLQ ingest payload is missing tenant_id")
                 req = IngestTextRequest(
                     content=payload["content"],
                     source_id=payload["source_id"],
                     metadata=payload.get("metadata", {}),
+                    tenant_id=tenant_id,
                 )
                 # 调用同步方法（IngestService.ingest_text 是同步的）
                 result = ingest_svc.ingest_text(req)
+                if result.chunks_count == 0:
+                    raise ValueError("摄入任务未生成任何文本块，未写入向量库")
                 logger.info("✅ Ingest completed: %s", result)
             except Exception as e:
                 logger.error("❌ Ingest failed: %s", e)
