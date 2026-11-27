@@ -49,20 +49,36 @@ class RedisStreamWorker:
     """理解文档:Redis Stream 消费系统完全指南.md"""
 
     async def _consume(self) -> None:
+        cursor = "0-0"
         while not self._stop_event.is_set():
-            messages = cast(
-                StreamResponse,
-                await self._redis.xreadgroup(
+            try:
+                cursor, pending, deleted = await self._redis.xautoclaim(
+                    self._stream_key,
                     self._group_name,
                     self._consumer_name,
-                    {self._stream_key: ">"},
+                    min_idle_time=1000,
+                    start_id=cursor,
                     count=10,
-                    block=1000,
-                ),
-            )
-            for _, entries in messages:
-                for message_id, fields in entries:
-                    await self._handle_message(message_id, fields)
+                )
+                if deleted:
+                    logger.error("待确认消息已从 Stream 删除，无法恢复：ids=%s", deleted)
+
+                messages = cast(
+                    StreamResponse,
+                    await self._redis.xreadgroup(
+                        self._group_name,
+                        self._consumer_name,
+                        {self._stream_key: ">"},
+                        count=10,
+                        block=1000,
+                    ),
+                )
+                for _, entries in messages:
+                    for message_id, fields in entries:
+                        await self._handle_message(message_id, fields)
+            except RedisError as e:
+                logger.error(f"Redis error while consuming stream: {e}")
+                await asyncio.sleep(1)
 
     async def _handle_message(self, message_id: str, fields: dict[str, str]) -> None:
         payload: Any = None
