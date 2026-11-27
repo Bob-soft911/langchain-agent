@@ -69,8 +69,8 @@ class RedisStreamWorker:
         try:
             payload = json.loads(fields["payload"])
             await self._handler(payload)
-            await self._redis.xack(self._stream_key, self._group_name, message_id)
-        except (RedisError, ValueError, Exception, KeyError) as e:
+            # await self._redis.xack(self._stream_key, self._group_name, message_id)
+        except Exception as e:
             logger.exception("Stream task failed: message_id=%s", message_id)
             tenant_id = payload.get("tenant_id") if isinstance(payload, dict) else None
             owner = (
@@ -85,5 +85,6 @@ class RedisStreamWorker:
                 failure_reason=str(e),
                 owner=owner,
                 handler_key="ingest" if replayable else NON_REPLAYABLE_HANDLER,
+                stream_source=(self._stream_key, self._group_name, message_id),
             )
-            await self._redis.xack(self._stream_key, self._group_name, message_id)
+        await self._redis.xack(self._stream_key, self._group_name, message_id)

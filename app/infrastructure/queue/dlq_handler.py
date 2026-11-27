@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -19,6 +20,7 @@ from enum import Enum
 from typing import Any, Awaitable, cast
 
 from pydantic.dataclasses import dataclass
+from redis import RedisError
 from redis import asyncio as redis_asyncio
 
 from app.config.settings import settings
@@ -150,17 +152,27 @@ class DeadLetterQueue:
         if not self.redis:
             return
         try:
-            ttl_seconds = 7 * 24 * 3600  # 条目最多保留 7 天
-            await self.redis.set(
-                self._entry_keys(entry.dlq_id), json.dumps(entry.to_dict(), ensure_ascii=False)
-            )
-            index_key = self._redis_index_key(entry.owner)
-            await self.redis.sadd(index_key, entry.dlq_id)
-            await self.redis.sadd("dlq:owners", index_key)
-            await self.redis.expire(index_key, ttl_seconds)
-            await self.redis.expire(self._entry_keys(entry.dlq_id), ttl_seconds)
+            await self._write_entry(entry)
         except (ConnectionError, TimeoutError, ValueError, redis_asyncio.RedisError) as e:
             logger.error(f"Failed to persist DLQ entry: {e}")
+
+    async def _write_entry(self, entry: DLQEntry, *, create_only: bool = False) -> DLQEntry:
+        if self.redis is None:
+            raise RedisError("DLQ Redis 未初始化")
+        key = self._entry_keys(entry.dlq_id)
+        index_key = self._redis_index_key(entry.owner)
+        ttl = 7 * 24 * 3600
+        async with self.redis.pipeline() as pipe:
+            pipe.set(key, json.dumps(entry.to_dict(), ensure_ascii=False))
+            pipe.sadd(index_key, entry.dlq_id)
+            pipe.sadd("dlq:owners", index_key)
+            pipe.expire(index_key, ttl)
+            pipe.get(key)
+            result = await pipe.execute()
+        raw = result[-1]
+        if raw is None:
+            raise RedisError(f"DLQ 条目写入后无法读取：{entry.dlq_id}")
+        return DLQEntry.from_dict(json.loads(raw))
 
     async def _load_existing_entries(self) -> None:
         """从Redis加载现有条目"""
@@ -193,22 +205,34 @@ class DeadLetterQueue:
         *,
         owner: ResourceOwner,
         handler_key: str,
+        stream_source: tuple[str, str, str] | None = None,
     ) -> DLQEntry:
         """添加死信队列条目"""
-        with self._lock:
+        if stream_source is not None:
             dlq_id = f"dlq_{uuid.uuid4().hex[:12]}"
-            entry = DLQEntry(
-                dlq_id=dlq_id,
-                task_id=task_id,
-                payload=payload,
-                failure_reason=failure_reason,
-                max_retries=self.max_retries,
-                owner=owner,
-                handler_key=handler_key,
-            )
-            self._entries[dlq_id] = entry
-        await self._persist_entry(entry)
-        logger.warning(f"Added DLQ entry: {entry}")
+        else:
+            identity = json.dumps(stream_source, separators=(",", ":"))
+            dlq_id = f"dlq_stream_{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+        entry = DLQEntry(
+            dlq_id=dlq_id,
+            task_id=task_id,
+            payload=payload,
+            failure_reason=failure_reason,
+            max_retries=self.max_retries,
+            owner=owner,
+            handler_key=handler_key,
+        )
+        if stream_source is not None:
+            entry = await self._write_entry(entry, create_only=True)
+            with self._lock:
+                self._entries.setdefault(dlq_id, entry)
+            logger.warning(f"Added DLQ entry: {entry}")
+        else:
+            with self._lock:
+                self._entries[dlq_id] = entry
+            await self._persist_entry(entry)
+            logger.warning(f"Added DLQ entry: {entry}")
         return entry
 
     async def retry(
