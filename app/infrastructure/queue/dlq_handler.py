@@ -156,7 +156,9 @@ class DeadLetterQueue:
         except (ConnectionError, TimeoutError, ValueError, redis_asyncio.RedisError) as e:
             logger.error(f"Failed to persist DLQ entry: {e}")
 
-    async def _write_entry(self, entry: DLQEntry, *, create_only: bool = False) -> DLQEntry:
+    async def _write_entry(
+        self, entry: DLQEntry, *, create_only: bool = False
+    ) -> tuple[bool, DLQEntry]:
         if self.redis is None:
             raise RedisError("DLQ Redis 未初始化")
         key = self._entry_keys(entry.dlq_id)
@@ -169,10 +171,14 @@ class DeadLetterQueue:
             pipe.expire(index_key, ttl)
             pipe.get(key)
             result = await pipe.execute()
+        # `results[0] is None` → 代表 **SET NX：key 已存在，未新建**
+        # `results[0] is True` → 代表 **SET NX：本次成功新建 key**
+        # `results[-1]`（get 命令）key 不存在，读不到数据
+        set_ok = result[0] is not None
         raw = result[-1]
         if raw is None:
             raise RedisError(f"DLQ 条目写入后无法读取：{entry.dlq_id}")
-        return DLQEntry.from_dict(json.loads(raw))
+        return set_ok, DLQEntry.from_dict(json.loads(raw))
 
     async def _load_existing_entries(self) -> None:
         """从Redis加载现有条目"""
@@ -224,7 +230,7 @@ class DeadLetterQueue:
             handler_key=handler_key,
         )
         if stream_source is not None:
-            entry = await self._write_entry(entry, create_only=True)
+            set_ok, entry = await self._write_entry(entry, create_only=True)
             with self._lock:
                 self._entries.setdefault(dlq_id, entry)
             logger.warning(f"Added DLQ entry: {entry}")
