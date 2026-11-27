@@ -62,7 +62,9 @@ class RedisStreamWorker:
                 )
                 if deleted:
                     logger.error("待确认消息已从 Stream 删除，无法恢复：ids=%s", deleted)
-
+                for message_id, fields in pending:
+                    logger.warning("Pending message: id=%s", message_id)
+                    await self._handle_message(message_id, fields)
                 messages = cast(
                     StreamResponse,
                     await self._redis.xreadgroup(

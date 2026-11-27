@@ -163,7 +163,7 @@ class DeadLetterQueue:
         index_key = self._redis_index_key(entry.owner)
         ttl = 7 * 24 * 3600
         async with self.redis.pipeline() as pipe:
-            pipe.set(key, json.dumps(entry.to_dict(), ensure_ascii=False))
+            pipe.set(key, json.dumps(entry.to_dict(), ensure_ascii=False), nx=create_only, ex=ttl)
             pipe.sadd(index_key, entry.dlq_id)
             pipe.sadd("dlq:owners", index_key)
             pipe.expire(index_key, ttl)
@@ -208,7 +208,7 @@ class DeadLetterQueue:
         stream_source: tuple[str, str, str] | None = None,
     ) -> DLQEntry:
         """添加死信队列条目"""
-        if stream_source is not None:
+        if stream_source is None:
             dlq_id = f"dlq_{uuid.uuid4().hex[:12]}"
         else:
             identity = json.dumps(stream_source, separators=(",", ":"))

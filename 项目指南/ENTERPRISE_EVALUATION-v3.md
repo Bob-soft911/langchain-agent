@@ -48,7 +48,8 @@
     - 修复说明：`ResourceScopeClass` 新增 `owner_user_id` 与统一的 `can_access` 判定；干预查询、请求指标按租户+所有者校验（租户管理员可见本租户全部，越权与不存在统一返回 404）；提交干预、确认告警、文档摄入限定 `ADMIN`/`OPERATOR`，告警确认人取自 JWT；摄入接口拒绝平台管理员；JWT 解析强制角色与租户声明一致。负向用例见 `tests/integration/test_admin_auth_api.py`、`tests/unit/test_resource_isolation.py`、`tests/unit/test_intervention_handler.py`、`tests/unit/test_auth.py`。
 - [ 已修复] DLQ 重试调用真实业务处理器，不允许空操作返回成功；加入幂等键和重复执行防护。
     - 修复说明：摄入重放调用真实处理器，等待异步处理完成，零切块不标记为成功；向量写入使用稳定 ID 和 `upsert`，相同内容重放不会新增重复向量。同一进程内，同一条目只能由一个重试调用领取；多副本部署前仍需补充分布式原子领取。
-- [ ] 修复 DLQ 持久化失败仍 ACK 的数据丢失路径。
+- [ 已修复] 修复 DLQ 持久化失败仍 ACK 的数据丢失路径。
+    - 修复说明：业务失败时，只有 DLQ 转存成功才确认原消息；转存失败时保留待确认消息，由 `XAUTOCLAIM` 重新领取。重复转存使用稳定的条目 ID 和 `SET NX`，不覆盖已有重试状态。故障注入用例见 [test_redis_stream_worker.py](../tests/unit/test_redis_stream_worker.py)。
 - [ ] 移除异步 I/O 期间持有的同步锁，并增加并发重试测试。
 - [ ] 加入跨租户告警、干预、DLQ 和配置访问的负向集成测试。
 
